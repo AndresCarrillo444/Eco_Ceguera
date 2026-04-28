@@ -1,25 +1,7 @@
-# ExitRect wrapper (pygame.Rect no admite atributos extra)
 class ExitTile:
     def __init__(self, rect):
         self.rect     = rect
         self.revealed = 0
-
-"""
-ECO-CEGUERA
-===========
-Juego de sigilo con mecánica de sonar.
-- La pantalla está en negro. Emite pulsos de sonar para ver.
-- El sonar revela paredes y enemigos, pero también te delata.
-- Lanza "señuelos" (clic derecho) para distraer a los enemigos.
-- Llega a la salida (cuadrado dorado parpadeante) para ganar.
-
-Controles:
-  WASD / Flechas  - Mover
-  Clic Izquierdo  - Emitir sonar (te delata)
-  Clic Derecho    - Lanzar señuelo (distrae enemigos)
-  R               - Reiniciar
-  ESC             - Salir
-"""
 
 import pygame
 import math
@@ -323,6 +305,120 @@ def build_map():
     return walls, enemies, player_pos, exit_rect
 
 
+# ── Pantalla de inicio ───────────────────────────────────────────────────────
+
+def draw_start_screen(surf, font, small_font, tick):
+    """Renders an animated start screen. Returns the pygame.Rect of the play button."""
+    surf.fill(BLACK)
+
+    cx, cy = W // 2, H // 2
+
+    # ── Fondo: anillos de sonar animados ─────────────────────────────────────
+    num_rings = 5
+    for i in range(num_rings):
+        phase = (tick * 1.8 + i * (360 // num_rings)) % 360
+        radius = int((phase / 360) * max(W, H) * 0.85)
+        alpha_f = 1.0 - (phase / 360)
+        r = int(0 * alpha_f)
+        g = int(220 * alpha_f)
+        b = int(255 * alpha_f)
+        if radius > 0:
+            pygame.draw.circle(surf, (r, g, b), (cx, cy), radius, 1)
+
+    # ── Grid sutil de fondo ───────────────────────────────────────────────────
+    for gx in range(0, W, TILE):
+        pygame.draw.line(surf, (8, 15, 20), (gx, 0), (gx, H))
+    for gy in range(0, H, TILE):
+        pygame.draw.line(surf, (8, 15, 20), (0, gy), (W, gy))
+
+    # ── Panel central (glassmorphism) ─────────────────────────────────────────
+    panel_w, panel_h = 560, 380
+    panel_x = cx - panel_w // 2
+    panel_y = cy - panel_h // 2
+
+    panel_surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    panel_surf.fill((0, 30, 45, 180))
+    surf.blit(panel_surf, (panel_x, panel_y))
+
+    # Borde brillante
+    border_alpha = int(140 + 80 * (math.sin(tick * 0.05) * 0.5 + 0.5))
+    pygame.draw.rect(surf, (0, border_alpha, 180), (panel_x, panel_y, panel_w, panel_h), 2)
+    # Brillo en esquinas
+    corner_size = 10
+    for px, py in [(panel_x, panel_y), (panel_x + panel_w - corner_size, panel_y),
+                   (panel_x, panel_y + panel_h - corner_size),
+                   (panel_x + panel_w - corner_size, panel_y + panel_h - corner_size)]:
+        pygame.draw.rect(surf, CYAN, (px, py, corner_size, corner_size), 2)
+
+    # ── Título ────────────────────────────────────────────────────────────────
+    try:
+        title_font  = pygame.font.SysFont("consolas", 46, bold=True)
+        sub_font    = pygame.font.SysFont("consolas", 15)
+        ctrl_font   = pygame.font.SysFont("consolas", 14)
+        btn_font    = pygame.font.SysFont("consolas", 20, bold=True)
+    except Exception:
+        title_font = sub_font = ctrl_font = btn_font = font
+
+    # Sombra del título
+    glow_val = int(180 + 75 * (math.sin(tick * 0.06) * 0.5 + 0.5))
+    shadow = title_font.render("ECO-CEGUERA", True, (0, glow_val // 4, glow_val // 3))
+    surf.blit(shadow, (cx - shadow.get_width() // 2 + 3, panel_y + 36 + 3))
+    title_surf = title_font.render("ECO-CEGUERA", True, (0, glow_val, int(glow_val * 1.0)))
+    surf.blit(title_surf, (cx - title_surf.get_width() // 2, panel_y + 36))
+
+    subtitle = sub_font.render("Sigilo sónico  ·  Sonar  ·  Supervivencia", True, (0, 160, 200))
+    surf.blit(subtitle, (cx - subtitle.get_width() // 2, panel_y + 96))
+
+    # Separador
+    pygame.draw.line(surf, DARK_CYAN, (panel_x + 30, panel_y + 122), (panel_x + panel_w - 30, panel_y + 122), 1)
+
+    # ── Controles ─────────────────────────────────────────────────────────────
+    controls = [
+        ("WASD / Flechas",  "Mover al jugador"),
+        ("Clic Izquierdo",  "Emitir pulso sonar (te delata)"),
+        ("Clic Derecho",    "Lanzar señuelo (distrae enemigos)"),
+        ("R",               "Reiniciar partida"),
+        ("ESC",             "Salir al sistema operativo"),
+    ]
+    label_x  = panel_x + 36
+    value_x  = panel_x + 200
+    ctrl_y   = panel_y + 136
+    line_h   = 24
+    for key, desc in controls:
+        k_surf = ctrl_font.render(key, True, CYAN)
+        d_surf = ctrl_font.render(desc, True, (160, 200, 220))
+        surf.blit(k_surf, (label_x, ctrl_y))
+        surf.blit(d_surf, (value_x, ctrl_y))
+        ctrl_y += line_h
+
+    # Separador
+    pygame.draw.line(surf, DARK_CYAN, (panel_x + 30, panel_y + 300), (panel_x + panel_w - 30, panel_y + 300), 1)
+
+    # ── Botón JUGAR ───────────────────────────────────────────────────────────
+    btn_w, btn_h = 200, 44
+    btn_x = cx - btn_w // 2
+    btn_y = panel_y + panel_h - 66
+    btn_rect = pygame.Rect(btn_x, btn_y, btn_w, btn_h)
+
+    mouse_pos = pygame.mouse.get_pos()
+    hovered = btn_rect.collidepoint(mouse_pos)
+
+    btn_color = (0, 200, 255) if hovered else (0, 140, 180)
+    btn_surf = pygame.Surface((btn_w, btn_h), pygame.SRCALPHA)
+    btn_surf.fill((*btn_color, 200 if hovered else 140))
+    surf.blit(btn_surf, (btn_x, btn_y))
+    pygame.draw.rect(surf, btn_color, btn_rect, 2)
+
+    btn_lbl = btn_font.render("[ JUGAR ]" if not hovered else ">> JUGAR <<", True, WHITE)
+    surf.blit(btn_lbl, (cx - btn_lbl.get_width() // 2, btn_y + btn_h // 2 - btn_lbl.get_height() // 2))
+
+    # Tip teclado
+    tip = ctrl_font.render("o presiona  ENTER / ESPACIO", True, (60, 100, 120))
+    surf.blit(tip, (cx - tip.get_width() // 2, btn_y + btn_h + 8))
+
+    return btn_rect
+
+
 # ── HUD ───────────────────────────────────────────────────────────────────────
 
 def draw_hud(surf, font, small_font, decoys, alert_count, caught, won):
@@ -372,6 +468,30 @@ def main():
     except Exception:
         font       = pygame.font.Font(None, 24)
         small_font = pygame.font.Font(None, 16)
+
+    # ── Pantalla de inicio ────────────────────────────────────────────────────
+    intro_tick = 0
+    in_intro   = True
+    while in_intro:
+        clock.tick(FPS)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    in_intro = False
+                elif event.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    sys.exit()
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                btn_rect = draw_start_screen(screen, font, small_font, intro_tick)
+                if btn_rect.collidepoint(event.pos):
+                    in_intro = False
+
+        btn_rect = draw_start_screen(screen, font, small_font, intro_tick)
+        pygame.display.flip()
+        intro_tick += 1
 
     def new_game():
         walls, enemies, ppos, exit_r = build_map()
