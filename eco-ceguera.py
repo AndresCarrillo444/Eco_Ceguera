@@ -7,14 +7,54 @@ import pygame
 import math
 import random
 import sys
+import json
+import os
+import socket
+import threading
 from collections import deque
 import heapq
 import asyncio
+
 try:
     import numpy as np
     _HAS_NUMPY = True
 except ImportError:
     _HAS_NUMPY = False
+
+#  Feature modules (leaderboard, co-op, editor)
+from eco_features import (
+    lb_submit, lb_is_record, draw_leaderboard, draw_name_input,
+    draw_pause_menu,
+    Player2,
+    EDITOR_PALETTE, empty_editor_grid, build_map_from_editor, draw_editor,
+)
+from eco_settings import (
+    settings_load, settings_save, draw_settings_menu,
+    custom_level_save, custom_level_load, custom_levels_list, custom_level_delete,
+    draw_save_level_dialog,
+)
+try:
+    from eco_online_lb import ol_submit, ol_fetch_all, ol_fetch
+except Exception:
+    def ol_submit(*a, **kw): pass
+    def ol_fetch_all(*a, **kw): pass
+    def ol_fetch(*a, **kw): pass
+
+try:
+    from eco_audio import (
+        audio_init, play_sfx, music_set_state, music_tick,
+        music_set_volume, sfx_set_volume,
+    )
+    _HAS_AUDIO = True
+except Exception:
+    def audio_init(): pass
+    def play_sfx(n): pass
+    def music_set_state(s): pass
+    def music_tick(): pass
+    def music_set_volume(v): pass
+    def sfx_set_volume(v): pass
+    _HAS_AUDIO = False
+
 
 #  Configuración 
 W, H          = 900, 700
@@ -24,6 +64,8 @@ TILE          = 40
 # Colores base
 BLACK         = (0, 0, 0)
 WHITE         = (255, 255, 255)
+cfg_settings  = {}
+
 CYAN          = (0, 220, 255)
 RED           = (255, 60, 60)
 ORANGE        = (255, 160, 40)
@@ -39,48 +81,78 @@ ENEMY_RADIUS      = 10
 SONAR_SPEED       = 4
 SONAR_MAX_RADIUS  = 320
 SONAR_THICKNESS   = 1
-REVEAL_DURATION   = 90       # frames que un objeto queda visible tras el eco
+REVEAL_DURATION   = 90       
 ENEMY_SPEED_BASE  = 0.9
 ENEMY_ALERT_SPEED = 2.2
-ENEMY_ALERT_TIME  = 180      # frames en alerta antes de volver a patrullar
-DECOY_COUNT       = 3        # señuelos por partida
+ENEMY_ALERT_TIME  = 180        
+DECOY_COUNT       = 3        
 
-# ── Configuración de niveles ────────────────────────────────────────────────
+#  Configuración de niveles 
 LEVEL_CONFIGS = [
     {'name': 'PRIMER CONTACTO',  'subtitle': 'Aprende a escuchar la oscuridad',
      'n_normal': 2, 'bat': False, 'heavy': False, 'n_traps': 0,
      'mat_metal': 0.10, 'mat_cork': 0.05, 'mat_mirror': 0.05,
      'reveal_dur': 110, 'sonar_radius': 320, 'micro_interval': 60, 'spd_mult': 0.8,
-     'mechanic': None},
+     'mechanic': None,
+     'n_mimic': 0, 'n_stalker': 0, 'n_water': 2, 'n_glass': 1, 'n_noise': 1, 'n_orbs': 3},
     {'name': 'ECOS ROJOS',       'subtitle': 'El murciélago ha despertado',
      'n_normal': 3, 'bat': True,  'heavy': False, 'n_traps': 2,
      'mat_metal': 0.20, 'mat_cork': 0.15, 'mat_mirror': 0.08,
      'reveal_dur': 80, 'sonar_radius': 300, 'micro_interval': 50, 'spd_mult': 1.0,
-     'mechanic': None},
+     'mechanic': None,
+     'n_mimic': 1, 'n_stalker': 0, 'n_water': 3, 'n_glass': 2, 'n_noise': 1, 'n_orbs': 2},
     {'name': 'CUENTA REGRESIVA', 'subtitle': 'La salida se cierra en 90 segundos',
      'n_normal': 3, 'bat': True,  'heavy': True,  'n_traps': 3,
      'mat_metal': 0.15, 'mat_cork': 0.30, 'mat_mirror': 0.10,
      'reveal_dur': 70, 'sonar_radius': 280, 'micro_interval': 45, 'spd_mult': 1.0,
-     'mechanic': 'timer', 'timer_secs': 90},
+     'mechanic': 'timer', 'timer_secs': 90,
+     'n_mimic': 1, 'n_stalker': 1, 'n_water': 3, 'n_glass': 2, 'n_noise': 2, 'n_orbs': 2},
     {'name': 'CAMPO MINADO',     'subtitle': 'Las trampas se regeneran cada 15 s',
      'n_normal': 4, 'bat': True,  'heavy': True,  'n_traps': 10,
      'mat_metal': 0.25, 'mat_cork': 0.20, 'mat_mirror': 0.10,
      'reveal_dur': 60, 'sonar_radius': 260, 'micro_interval': 40, 'spd_mult': 1.2,
-     'mechanic': 'respawn_traps', 'respawn_frames': 900},
+     'mechanic': 'respawn_traps', 'respawn_frames': 900,
+     'n_mimic': 2, 'n_stalker': 1, 'n_water': 4, 'n_glass': 3, 'n_noise': 2, 'n_orbs': 1},
     {'name': 'EL ABISMO',        'subtitle': 'La oscuridad te consume cada 15 s',
      'n_normal': 5, 'bat': True,  'heavy': True,  'n_traps': 6,
      'mat_metal': 0.25, 'mat_cork': 0.25, 'mat_mirror': 0.12,
      'reveal_dur': 45, 'sonar_radius': 240, 'micro_interval': 35, 'spd_mult': 1.5,
-     'mechanic': 'blackout', 'blackout_interval': 900},
+     'mechanic': 'blackout', 'blackout_interval': 900,
+     'n_mimic': 2, 'n_stalker': 2, 'n_water': 5, 'n_glass': 3, 'n_noise': 3, 'n_orbs': 1},
+    # ── NEW LEVELS (showcasing new features) ────────────────────────────────
+    {'name': 'EL ESPEJO ROTO',   'subtitle': 'El suelo traiciona cada paso',
+     'n_normal': 3, 'bat': False, 'heavy': False, 'n_traps': 2,
+     'mat_metal': 0.05, 'mat_cork': 0.05, 'mat_mirror': 0.30,
+     'reveal_dur': 90, 'sonar_radius': 310, 'micro_interval': 55, 'spd_mult': 0.9,
+     'mechanic': None,
+     'n_mimic': 0, 'n_stalker': 0, 'n_water': 6, 'n_glass': 5, 'n_noise': 3, 'n_orbs': 2},
+    {'name': 'SOMBRA SILENCIOSA','subtitle': 'No lo escucharás venir',
+     'n_normal': 2, 'bat': False, 'heavy': False, 'n_traps': 1,
+     'mat_metal': 0.15, 'mat_cork': 0.10, 'mat_mirror': 0.05,
+     'reveal_dur': 85, 'sonar_radius': 290, 'micro_interval': 50, 'spd_mult': 1.0,
+     'mechanic': None,
+     'n_mimic': 0, 'n_stalker': 3, 'n_water': 2, 'n_glass': 2, 'n_noise': 2, 'n_orbs': 2},
+    {'name': 'EL IMPOSTOR',      'subtitle': 'La salida no es lo que parece',
+     'n_normal': 2, 'bat': True,  'heavy': False, 'n_traps': 2,
+     'mat_metal': 0.15, 'mat_cork': 0.10, 'mat_mirror': 0.08,
+     'reveal_dur': 75, 'sonar_radius': 280, 'micro_interval': 48, 'spd_mult': 1.1,
+     'mechanic': None,
+     'n_mimic': 4, 'n_stalker': 1, 'n_water': 2, 'n_glass': 2, 'n_noise': 1, 'n_orbs': 2},
+    {'name': 'LA GALERIA',       'subtitle': 'Recoge los ecos antes de escapar',
+     'n_normal': 4, 'bat': True,  'heavy': True,  'n_traps': 4,
+     'mat_metal': 0.20, 'mat_cork': 0.20, 'mat_mirror': 0.10,
+     'reveal_dur': 65, 'sonar_radius': 270, 'micro_interval': 42, 'spd_mult': 1.3,
+     'mechanic': 'timer', 'timer_secs': 120,
+     'n_mimic': 2, 'n_stalker': 2, 'n_water': 4, 'n_glass': 3, 'n_noise': 3, 'n_orbs': 8},
 ]
 N_LEVELS = len(LEVEL_CONFIGS)
 
 
 # Nuevas mecánicas
-PLAYER_SNEAK_SPEED   = 1.5   # velocidad al caminar (Shift)
-MICRO_PULSE_INTERVAL = 50    # frames entre micropulsos al correr
+PLAYER_SNEAK_SPEED   = 1.5   
+MICRO_PULSE_INTERVAL = 50    
 BAT_RADIUS           = 7
-BAT_SONAR_INTERVAL   = 80    # frames entre sonar del murciélago
+BAT_SONAR_INTERVAL   = 80    
 BAT_SONAR_RADIUS     = 200
 HEAVY_RADIUS         = 18
 HEAVY_SPEED          = 0.45
@@ -98,9 +170,9 @@ MAT_NORMAL  = 'normal'
 MAT_METAL   = 'metal'
 MAT_CORK    = 'cork'
 MAT_MIRROR  = 'mirror'
-METAL_COLOR  = (90, 120, 150)   # acero azul-gris
-CORK_COLOR   = (90, 60, 30)     # marrón oscuro
-MIRROR_COLOR = (180, 220, 255)  # espejo plateado-frío
+METAL_COLOR  = (90, 120, 150)  
+CORK_COLOR   = (90, 60, 30)     
+MIRROR_COLOR = (180, 220, 255) 
 
 # Dimensiones del mapa generado proceduralmente (deben ser impares)
 COLS  = 23
@@ -159,7 +231,7 @@ def astar(wall_grid, start, goal):
                     heapq.heappush(open_set, (ng+h(nr,nc), ng, (nr,nc)))
     return []
 
-# ── Sistema de sonido procedural ─────────────────────────────────────────
+#  Sistema de sonido procedural 
 
 def _make_sound(freq=440, duration=0.08, vol=0.18, wave='sine', decay=True):
     """Genera un sonido sintético sin archivos externos. Requiere numpy."""
@@ -186,11 +258,11 @@ def _make_sound(freq=440, duration=0.08, vol=0.18, wave='sine', decay=True):
         return None
 
 # Pre-generar sonidos al inicio (se reusan cada frame)
-_snd_sonar  = None   # pulso del jugador
-_snd_mirror = None   # rebote en espejo
-_snd_trap   = None   # trampa activada
-_snd_win    = None   # victoria
-_snd_lose   = None   # derrota
+_snd_sonar  = None   
+_snd_mirror = None   
+_snd_trap   = None   
+_snd_win    = None   
+_snd_lose   = None   
 
 def _init_sounds():
     global _snd_sonar, _snd_mirror, _snd_trap, _snd_win, _snd_lose
@@ -294,9 +366,9 @@ class SonarPulse:
                     # Determinar cuál cara fue impactada
                     dx_hit = self.x - w.rect.centerx
                     dy_hit = self.y - w.rect.centery
-                    if abs(dx_hit) >= abs(dy_hit):  # cara izq/der → refleja X
+                    if abs(dx_hit) >= abs(dy_hit):  
                         nx_r, ny_r = -1.0, 0.0
-                    else:                            # cara arriba/abajo → refleja Y
+                    else:                            
                         nx_r, ny_r = 0.0, -1.0
                     # Dirección incidente del pulso (desde centro hacia pared)
                     idx_ = hit_x - self.x; idy_ = hit_y - self.y
@@ -315,7 +387,7 @@ class SonarPulse:
                                          max_radius=rem)
                         ref.revealed.add(id(w))
                         new_pulses.append(ref)
-                        play_sound(_snd_mirror)
+                        play_sfx("mirror")
                 else:
                     w.reveal = max(w.reveal, REVEAL_DURATION)
 
@@ -342,7 +414,7 @@ class SonarPulse:
             dp = dist((self.x, self.y), (player.x, player.y))
             if abs(dp - self.radius) < SONAR_SPEED + 6:
                 player.caught = True
-
+    
         return new_pulses
 
 
@@ -350,15 +422,17 @@ class SonarPulse:
         if self.dead:
             return
         alpha_f = 1.0 - (self.radius / max(self.max_radius, 1))
-        color = lerp_color(BLACK, self.color, alpha_f * 0.9)
+        hc = cfg_settings.get("high_contrast", False)
+        color = lerp_color(BLACK, self.color, min(1.0, alpha_f * (1.5 if hc else 0.9)))
         cx = int(self.x - offset[0])
         cy = int(self.y - offset[1])
         if 0 < self.radius:
-            pygame.draw.circle(surf, color, (cx, cy), int(self.radius), SONAR_THICKNESS)
+            th = SONAR_THICKNESS + (1 if hc else 0)
+            pygame.draw.circle(surf, color, (cx, cy), int(self.radius), th)
 
 
 class Enemy:
-    def __init__(self, x, y):
+    def __init__(self, x, y, patrol_route=None):
         self.x        = x
         self.y        = y
         self.reveal   = 0
@@ -369,23 +443,33 @@ class Enemy:
         self.speed    = ENEMY_SPEED_BASE
         self.dead     = False
         self.trail    = []
+        # Fixed patrol route: list of (world_x, world_y) or None for random
+        self.patrol_route     = patrol_route  
+        self.patrol_route_idx = 0
         # FSM
         self.state       = STATE_PATROL
-        self.path        = []       # A* waypoints [(row, col)]
+        self.path        = []      
         self.path_idx    = 0
         self.path_dirty  = False
         self.lost_timer  = 0
         self.sound_x     = x
         self.sound_y     = y
-        self.chase_timer = 0        # countdown to refresh chase path
+        self.chase_timer = 0        
         self._pick_patrol()
 
     def _pick_patrol(self):
-        angle = random.uniform(0, 2 * math.pi)
-        dist_r = random.uniform(40, 120)
-        self.target_x = self.x + math.cos(angle) * dist_r
-        self.target_y = self.y + math.sin(angle) * dist_r
-        self.patrol_timer = random.randint(90, 200)
+        if self.patrol_route:
+            # Advance to next waypoint in the fixed route
+            wp = self.patrol_route[self.patrol_route_idx % len(self.patrol_route)]
+            self.target_x, self.target_y = wp
+            self.patrol_route_idx += 1
+            self.patrol_timer = 30   
+        else:
+            angle = random.uniform(0, 2 * math.pi)
+            dist_r = random.uniform(40, 120)
+            self.target_x = self.x + math.cos(angle) * dist_r
+            self.target_y = self.y + math.sin(angle) * dist_r
+            self.patrol_timer = random.randint(90, 200)
 
     def alert(self, tx, ty):
         self.sound_x    = tx
@@ -393,7 +477,7 @@ class Enemy:
         self.alert_t    = ENEMY_ALERT_TIME
         self.speed      = ENEMY_ALERT_SPEED
         self.state      = STATE_INVESTIGATE
-        self.path_dirty = True      # recompute A* next update
+        self.path_dirty = True     
 
     def _follow_path(self):
         """Steer target_x/y toward next waypoint in self.path."""
@@ -419,7 +503,7 @@ class Enemy:
             self.path_idx = 0
             self.path_dirty = False
 
-        # ── FSM ──────────────────────────────────────────────────────────
+        #  FSM 
         if self.state == STATE_PATROL:
             self.speed = ENEMY_SPEED_BASE
             self.patrol_timer -= 1
@@ -476,7 +560,7 @@ class Enemy:
                     self.target_x = self.sound_x + math.cos(ang) * r2
                     self.target_y = self.sound_y + math.sin(ang) * r2
 
-        # ── Flocking (PATROL sólo) ────────────────────────────────────────
+        #  Flocking (PATROL sólo) 
         flock_dx = flock_dy = 0.0
         if self.state == STATE_PATROL and all_enemies:
             sep_x = sep_y = coh_x = coh_y = ali_x = ali_y = 0.0
@@ -504,7 +588,7 @@ class Enemy:
                 flock_dx = sep_x + coh_x + ali_x
                 flock_dy = sep_y + coh_y + ali_y
 
-        # ── Movimiento ────────────────────────────────────────────────────
+        #  Movimiento 
         dx = self.target_x - self.x + flock_dx
         dy = self.target_y - self.y + flock_dy
         d  = math.hypot(dx, dy)
@@ -534,7 +618,7 @@ class Enemy:
 
     def draw(self, surf, offset):
         # Subtle darkness-distortion trail — always drawn, no sonar needed
-        for i, (tx, ty) in enumerate(self.trail):
+        for i, (tx, ty) in (enumerate(self.trail) if cfg_settings.get("show_trail", True) else []):
             t = (i + 1) / max(len(self.trail), 1)
             tcx = int(tx - offset[0])
             tcy = int(ty - offset[1])
@@ -579,7 +663,7 @@ class BatEnemy(Enemy):
         return None
 
     def draw(self, surf, offset):
-        for i, (tx, ty) in enumerate(self.trail):
+        for i, (tx, ty) in (enumerate(self.trail) if cfg_settings.get("show_trail", True) else []):
             t = (i + 1) / max(len(self.trail), 1)
             b = int(t * 48)
             if b > 5:
@@ -606,7 +690,7 @@ class HeavyEnemy(Enemy):
         self.speed = HEAVY_SPEED
 
     def draw(self, surf, offset):
-        for i, (tx, ty) in enumerate(self.trail):
+        for i, (tx, ty) in (enumerate(self.trail) if cfg_settings.get("show_trail", True) else []):
             t = (i + 1) / max(len(self.trail), 1)
             b = int(t * 48)
             if b > 5:
@@ -656,7 +740,335 @@ class SoundTrap:
         pygame.draw.circle(surf, c, (rx, ry), 2)
 
 
+
+# ─── NEW MECHANICS CONSTANTS ─────────────────────────────────────────────────
+HAZARD_WATER  = 'water'    # emit loud pulse when running through
+HAZARD_GLASS  = 'glass'    # one-time loud pulse, then disappears
+HEARTBEAT_MIN = 180        # frames between heartbeat at low alert
+HEARTBEAT_MAX = 40         # frames between heartbeat at full chase
+CONE_ANGLE    = 40         # degrees half-angle for focused sonar
+CONE_RANGE    = 500        # max range of focused sonar
+ROCK_RANGE    = 350        # max throw range for rocks
+ABSORBER_DURATION = 180    # frames sound absorber is active
+
+
+class FloorHazard:
+    """Water puddle or broken glass on the floor.
+    Water: if player runs through, emits a medium sonar pulse.
+    Glass: one-time loud pulse, then disappears."""
+    def __init__(self, cx, cy, htype=HAZARD_WATER):
+        self.cx    = cx
+        self.cy    = cy
+        self.htype = htype
+        r = TILE // 2 - 4
+        self.rect  = pygame.Rect(cx - r, cy - r, r * 2, r * 2)
+        self.gone  = False
+        self.ripple_timer = 0   # visual ripple for water
+
+    def check(self, player, sneaking=False):
+        """Returns SonarPulse or None. sneaking suppresses water noise."""
+        if self.gone:
+            return None
+        pr = pygame.Rect(player.x - PLAYER_RADIUS, player.y - PLAYER_RADIUS,
+                         PLAYER_RADIUS * 2, PLAYER_RADIUS * 2)
+        if pr.colliderect(self.rect):
+            if self.htype == HAZARD_GLASS:
+                self.gone = True
+                return SonarPulse(self.cx, self.cy, color=(200, 220, 255),
+                                  is_decoy=True, max_radius=380)
+            elif self.htype == HAZARD_WATER and not sneaking:
+                return SonarPulse(self.cx, self.cy, color=(80, 160, 255),
+                                  is_decoy=True, max_radius=200)
+        return None
+
+    def update(self):
+        if self.htype == HAZARD_WATER:
+            self.ripple_timer = (self.ripple_timer + 1) % 60
+
+    def draw(self, surf, offset):
+        if self.gone:
+            return
+        rx = self.cx - offset[0]
+        ry = self.cy - offset[1]
+        if self.htype == HAZARD_WATER:
+            phase = self.ripple_timer / 60.0
+            a = int(30 + 20 * math.sin(phase * 2 * math.pi))
+            pygame.draw.ellipse(surf, (0, a, int(a * 2.5)),
+                                (rx - 10, ry - 5, 20, 10), 1)
+            pygame.draw.ellipse(surf, (0, a // 2, a),
+                                (rx - 6, ry - 3, 12, 6), 1)
+        else:  # glass
+            c = (70, 80, 100)
+            for dx2, dy2 in [(-5, -3), (5, -3), (0, 6), (-3, 3), (4, 2)]:
+                pygame.draw.line(surf, c, (rx, ry), (rx + dx2, ry + dy2), 1)
+            pygame.draw.circle(surf, (120, 140, 170), (rx, ry), 2)
+
+
+class NoiseZone:
+    """Area with background noise (fans/wind).
+    Inside: player steps are muffled (sonar micro-pulses suppressed).
+    The zone itself draws a faint visual shimmer."""
+    def __init__(self, cx, cy, radius=70):
+        self.cx     = cx
+        self.cy     = cy
+        self.radius = radius
+        self._tick  = random.randint(0, 60)
+
+    def contains(self, x, y):
+        return math.hypot(x - self.cx, y - self.cy) < self.radius
+
+    def update(self):
+        self._tick += 1
+
+    def draw(self, surf, offset):
+        rx = int(self.cx - offset[0])
+        ry = int(self.cy - offset[1])
+        a = int(18 + 10 * math.sin(self._tick * 0.08))
+        for i in range(1, 4):
+            r2 = int(self.radius * i / 3)
+            pygame.draw.circle(surf, (0, a, a // 2), (rx, ry), r2, 1)
+        # Wind particles
+        for i in range(3):
+            ang = (self._tick * 0.04 + i * 2.1) % (2 * math.pi)
+            pr2 = int(self.radius * 0.6)
+            px2 = int(rx + math.cos(ang) * pr2)
+            py2 = int(ry + math.sin(ang) * pr2)
+            pygame.draw.circle(surf, (0, a, a), (px2, py2), 1)
+
+
+class EchoOrb:
+    """Collectible lore fragment. Touching it shows a brief message."""
+    _LORE = [
+        "El laboratorio cayó en silencio hace años...",
+        "Dicen que los guardias aún patrullan sin saberlo.",
+        "La oscuridad no es tu enemiga. El sonido sí.",
+        "Escuché pasos donde no debía haberlos.",
+        "El eco revela lo que los ojos nunca podrán.",
+        "Sobrevivir es simple: no hagas ruido.",
+        "Hay algo más grande moviéndose en las sombras.",
+        "Mi último pulso de sonar me delató...",
+    ]
+    def __init__(self, cx, cy):
+        self.cx       = cx
+        self.cy       = cy
+        self.radius   = 7
+        self.collected = False
+        self.message  = random.choice(EchoOrb._LORE)
+        self.msg_timer = 0
+        self._tick    = random.randint(0, 60)
+
+    def check(self, player):
+        if self.collected:
+            return
+        if math.hypot(player.x - self.cx, player.y - self.cy) < self.radius + PLAYER_RADIUS:
+            self.collected = True
+            self.msg_timer = 240   # show message for 4 seconds
+
+    def update(self):
+        self._tick += 1
+        if self.msg_timer > 0:
+            self.msg_timer -= 1
+
+    def draw(self, surf, offset):
+        if self.collected:
+            return
+        rx = int(self.cx - offset[0])
+        ry = int(self.cy - offset[1])
+        pulse = math.sin(self._tick * 0.07) * 0.5 + 0.5
+        col = (int(100 + 80 * pulse), int(60 + 40 * pulse), int(200 + 55 * pulse))
+        pygame.draw.circle(surf, col, (rx, ry), self.radius, 2)
+        pygame.draw.circle(surf, (180, 120, 255), (rx, ry), 3)
+
+    def draw_message(self, surf, font):
+        if self.msg_timer <= 0:
+            return
+        try:
+            mf = pygame.font.SysFont("consolas", 14)
+        except Exception:
+            mf = font
+        alpha = min(1.0, self.msg_timer / 30.0)
+        col = (int(180 * alpha), int(120 * alpha), int(255 * alpha))
+        sw = surf.get_width()
+        sh = surf.get_height()
+        ms = mf.render(f'"{self.message}"', True, col)
+        surf.blit(ms, (sw // 2 - ms.get_width() // 2, sh - 60))
+
+
+class SoundAbsorber:
+    """One-use consumable. Activated with E key.
+    Silences all sonar pulses within radius for ABSORBER_DURATION frames."""
+    def __init__(self):
+        self.count    = 1       # player starts with 1
+        self.active   = False
+        self.timer    = 0
+        self.radius   = 120
+
+    def activate(self):
+        if self.count > 0 and not self.active:
+            self.count   -= 1
+            self.active  = True
+            self.timer   = ABSORBER_DURATION
+
+    def update(self):
+        if self.active:
+            self.timer -= 1
+            if self.timer <= 0:
+                self.active = False
+
+    def cancels(self, px, py, pulse_x, pulse_y):
+        """Returns True if a pulse at (pulse_x, pulse_y) is cancelled."""
+        if not self.active:
+            return False
+        return math.hypot(px - pulse_x, py - pulse_y) < self.radius
+
+    def draw_hud(self, surf, x, y, font):
+        try:
+            sf = pygame.font.SysFont("consolas", 13)
+        except Exception:
+            sf = font
+        col = (100, 220, 180) if self.count > 0 else (50, 60, 70)
+        label = f"Absorb[E]: {self.count}"
+        if self.active:
+            label += f" ●{self.timer // 60 + 1}s"
+            col = (0, 255, 200)
+        s = sf.render(label, True, col)
+        surf.blit(s, (x, y))
+
+
+class ThrowableRock:
+    """Thrown via Q + left-click on target. Creates a noise pulse on impact."""
+    def __init__(self, sx, sy, tx, ty):
+        self.x     = float(sx)
+        self.y     = float(sy)
+        angle      = math.atan2(ty - sy, tx - sx)
+        speed      = 8.0
+        self.vx    = math.cos(angle) * speed
+        self.vy    = math.sin(angle) * speed
+        self.tx    = tx
+        self.ty    = ty
+        self.dead  = False
+        self.trail = []
+
+    def update(self, walls):
+        if self.dead:
+            return None
+        self.trail.append((self.x, self.y))
+        if len(self.trail) > 8:
+            self.trail.pop(0)
+        self.x += self.vx
+        self.y += self.vy
+        # Wall collision or near target
+        r = pygame.Rect(self.x - 3, self.y - 3, 6, 6)
+        if any(r.colliderect(w.rect) for w in walls):
+            self.dead = True
+            return SonarPulse(self.x, self.y, color=(255, 200, 80),
+                              is_decoy=True, max_radius=300)
+        if math.hypot(self.x - self.tx, self.y - self.ty) < 10:
+            self.dead = True
+            return SonarPulse(self.x, self.y, color=(255, 200, 80),
+                              is_decoy=True, max_radius=300)
+        return None
+
+    def draw(self, surf, offset):
+        if self.dead:
+            return
+        for i, (tx2, ty2) in enumerate(self.trail):
+            a = (i + 1) / max(len(self.trail), 1)
+            c = (int(180 * a), int(130 * a), 0)
+            pygame.draw.circle(surf, c,
+                               (int(tx2 - offset[0]), int(ty2 - offset[1])), 2)
+        rx = int(self.x - offset[0])
+        ry = int(self.y - offset[1])
+        pygame.draw.circle(surf, (200, 160, 80), (rx, ry), 3)
+
+
+class MimicEnemy:
+    """Stationary enemy that pretends to be the exit tile.
+    If hit by a player sonar pulse, briefly reveals its true form."""
+    def __init__(self, cx, cy):
+        self.cx      = cx
+        self.cy      = cy
+        r            = TILE // 2 - 4
+        self.rect    = pygame.Rect(cx - r, cy - r, r * 2, r * 2)
+        self.revealed = 0
+        self.dead    = False   # dies when player escapes past it (not used for win)
+        self._tick   = 0
+        self.x       = float(cx)   # for dist checks
+        self.y       = float(cy)
+
+    def update(self, player):
+        self._tick += 1
+        if self.revealed > 0:
+            self.revealed -= 1
+        # If player walks into it while unrevealed → caught
+        if math.hypot(player.x - self.cx, player.y - self.cy) < PLAYER_RADIUS + 12:
+            player.caught = True
+
+    def on_sonar_hit(self):
+        self.revealed = REVEAL_DURATION
+
+    def draw(self, surf, offset):
+        rx = int(self.cx - offset[0])
+        ry = int(self.cy - offset[1])
+        if self.revealed > 0:
+            alpha = min(1.0, self.revealed / 20)
+            # Show true form: pulsing magenta diamond
+            col = lerp_color(BLACK, (255, 0, 200), alpha)
+            r2 = int(TILE // 2 - 4)
+            pts = [(rx, ry - r2), (rx + r2, ry), (rx, ry + r2), (rx - r2, ry)]
+            pygame.draw.polygon(surf, col, pts)
+            pygame.draw.polygon(surf, (255, 100, 255), pts, 2)
+        else:
+            # Disguise as exit tile (gold blinking square)
+            blink = (math.sin(self._tick * 0.12) + 1) / 2
+            col = lerp_color(BLACK, GOLD, blink * 0.6)
+            er = pygame.Rect(rx - 14, ry - 14, 28, 28)
+            pygame.draw.rect(surf, col, er)
+            pygame.draw.rect(surf, GOLD, er, 2)
+
+
+class StalkerEnemy(Enemy):
+    """Invisible enemy - emits NO sonar of its own.
+    Extremely fast when it detects the player's sonar origin."""
+    def __init__(self, x, y):
+        super().__init__(x, y)
+        self.speed    = 0.3   # slow by default
+        self.reveal   = 0     # stays 0 unless sonar hits it
+        self._stalk_t = 0
+
+    def on_sonar_detected(self, px, py):
+        """Called when player fires a sonar pulse - stalker heard the origin."""
+        self.speed = ENEMY_ALERT_SPEED * 1.4
+        self.alert(px, py)
+        self._stalk_t = 300
+
+    def update(self, walls, player, all_enemies=None, wall_grid=None):
+        super().update(walls, player, all_enemies, wall_grid)
+        if self._stalk_t > 0:
+            self._stalk_t -= 1
+            if self._stalk_t <= 0:
+                self.speed = 0.3
+
+    def draw(self, surf, offset):
+        # Draw a very faint dark distortion trail only
+        for i, (tx, ty) in (enumerate(self.trail) if cfg_settings.get("show_trail", True) else []):
+            t = (i + 1) / max(len(self.trail), 1)
+            b = int(t * 30)
+            if b > 3:
+                pygame.draw.circle(surf, (b // 2, 0, b),
+                                   (int(tx - offset[0]), int(ty - offset[1])),
+                                   max(1, int(t * 2)))
+        if self.reveal > 0:
+            alpha = min(1.0, self.reveal / 20)
+            col = lerp_color(BLACK, PURPLE, alpha)
+            cx2 = int(self.x - offset[0])
+            cy2 = int(self.y - offset[1])
+            pygame.draw.circle(surf, col, (cx2, cy2), ENEMY_RADIUS)
+            pygame.draw.circle(surf, (200, 100, 255), (cx2, cy2), ENEMY_RADIUS, 1)
+
+
 class Player:
+
     def __init__(self, x, y):
         self.x      = x
         self.y      = y
@@ -680,16 +1092,17 @@ class Player:
                 self.x, self.y = nx, ny
 
     def draw(self, surf, offset):
-        # Estela
-        for i, (tx, ty) in enumerate(self.trail):
+        # 1) ESTELA ROJA RÁPIDA
+        for i, (tx2, ty2) in (enumerate(self.trail) if cfg_settings.get("show_trail", True) else []):
             a = (i + 1) / len(self.trail) if self.trail else 1
             col = lerp_color(BLACK, GREEN, a * 0.5)
             r = max(1, int(PLAYER_RADIUS * a * 0.5))
-            pygame.draw.circle(surf, col, (int(tx - offset[0]), int(ty - offset[1])), r)
+            pygame.draw.circle(surf, col, (int(tx2 - offset[0]), int(ty2 - offset[1])), r)
         # Cuerpo
         cx = int(self.x - offset[0])
         cy = int(self.y - offset[1])
-        pygame.draw.circle(surf, GREEN, (cx, cy), PLAYER_RADIUS)
+        c = WHITE if cfg_settings.get("high_contrast", False) else GREEN
+        pygame.draw.circle(surf, c, (cx, cy), PLAYER_RADIUS)
         pygame.draw.circle(surf, WHITE, (cx, cy), PLAYER_RADIUS, 1)
 
 
@@ -807,8 +1220,45 @@ def build_map(cfg=None):
         col_i, row_i = floor_cells[idx]; idx += 1
         enemies.append(BatEnemy(col_i * TILE + TILE // 2, row_i * TILE + TILE // 2))
     if cfg.get('heavy', False) and idx < len(floor_cells):
-        col_i, row_i = floor_cells[idx]
+        col_i, row_i = floor_cells[idx]; idx += 1
         enemies.append(HeavyEnemy(col_i * TILE + TILE // 2, row_i * TILE + TILE // 2))
+
+    # NEW: Mimic enemies
+    for _ in range(cfg.get('n_mimic', 0)):
+        if idx < len(floor_cells):
+            col_i, row_i = floor_cells[idx]; idx += 1
+            enemies.append(MimicEnemy(col_i * TILE + TILE // 2, row_i * TILE + TILE // 2))
+
+    # NEW: Stalker enemies
+    for _ in range(cfg.get('n_stalker', 0)):
+        if idx < len(floor_cells):
+            col_i, row_i = floor_cells[idx]; idx += 1
+            enemies.append(StalkerEnemy(col_i * TILE + TILE // 2, row_i * TILE + TILE // 2))
+
+    # NEW: Floor hazards
+    floor_hazards = []
+    for col_i, row_i in floor_cells[idx:idx + cfg.get('n_water', 2)]:
+        floor_hazards.append(FloorHazard(col_i * TILE + TILE // 2,
+                                          row_i * TILE + TILE // 2, HAZARD_WATER))
+    idx += cfg.get('n_water', 2)
+    for col_i, row_i in floor_cells[idx:idx + cfg.get('n_glass', 1)]:
+        floor_hazards.append(FloorHazard(col_i * TILE + TILE // 2,
+                                          row_i * TILE + TILE // 2, HAZARD_GLASS))
+    idx += cfg.get('n_glass', 1)
+
+    # NEW: Noise zones
+    noise_zones = []
+    for col_i, row_i in floor_cells[idx:idx + cfg.get('n_noise', 1)]:
+        noise_zones.append(NoiseZone(col_i * TILE + TILE // 2,
+                                      row_i * TILE + TILE // 2,
+                                      radius=random.randint(55, 90)))
+    idx += cfg.get('n_noise', 1)
+
+    # NEW: Echo orbs
+    echo_orbs = []
+    for col_i, row_i in floor_cells[idx:idx + cfg.get('n_orbs', 2)]:
+        echo_orbs.append(EchoOrb(col_i * TILE + TILE // 2,
+                                  row_i * TILE + TILE // 2))
 
     # Build wall grid for A* pathfinding
     wall_grid = [[False] * COLS for _ in range(ROWS)]
@@ -818,7 +1268,8 @@ def build_map(cfg=None):
         if 0 <= gr < ROWS and 0 <= gc < COLS:
             wall_grid[gr][gc] = True
 
-    return walls, enemies, player_pos, exit_rect, traps, wall_grid
+    return walls, enemies, player_pos, exit_rect, traps, wall_grid, \
+           floor_hazards, noise_zones, echo_orbs
 
 
 
@@ -894,7 +1345,7 @@ def draw_resolution_select(surf, tick, sel, resolutions, font, small_font):
 
 #  Pantalla de inicio 
 
-# ── Partículas flotantes del menú ──────────────────────────────────────────
+#  Partículas flotantes del menú 
 _menu_particles = []
 def _init_menu_particles():
     global _menu_particles
@@ -925,7 +1376,7 @@ def draw_start_screen(surf, font, small_font, tick, menu_sel=0, show_credits=Fal
     surf.fill(BLACK)
     cx, cy = W // 2, H // 2
 
-    # ── Fondo: grid + partículas sonar ────────────────────────────────────
+    #  Fondo: grid + partículas sonar 
     for gx in range(0, W, TILE):
         pygame.draw.line(surf, (6, 12, 18), (gx, 0), (gx, H))
     for gy in range(0, H, TILE):
@@ -938,15 +1389,15 @@ def draw_start_screen(surf, font, small_font, tick, menu_sel=0, show_credits=Fal
             col = (0, int(180 * af), int(220 * af))
             pygame.draw.circle(surf, col, (int(p['x']), int(p['y'])), int(p['r']), 1)
 
-    # ── Scanlines decorativas ──────────────────────────────────────────────
+    #  Scanlines decorativas 
     for sy in range(0, H, 4):
         pygame.draw.line(surf, (0, 5, 8), (0, sy), (W, sy))
 
-    # ── Panel principal ───────────────────────────────────────────────────
+    #  Panel principal 
     panel_w = min(560, W - 60)
-    panel_h = 420
+    panel_h = 500          # taller to fit 7 menu buttons
     panel_x = cx - panel_w // 2
-    panel_y = cy - panel_h // 2
+    panel_y = max(8, cy - panel_h // 2)   # clamp so it never goes above screen
 
     # Sombra del panel
     shadow_s = pygame.Surface((panel_w + 12, panel_h + 12), pygame.SRCALPHA)
@@ -970,7 +1421,7 @@ def draw_start_screen(surf, font, small_font, tick, menu_sel=0, show_credits=Fal
                      (panel_x + panel_w - csz, panel_y + panel_h - csz)]:
         pygame.draw.rect(surf, (0, cv, 255), (px2, py2, csz, csz), 2)
 
-    # ── Título con efecto glitch ──────────────────────────────────────────
+    #  Título con efecto glitch 
     try:
         title_font = pygame.font.SysFont("consolas", 50, bold=True)
         sub_font   = pygame.font.SysFont("consolas", 14)
@@ -1010,17 +1461,19 @@ def draw_start_screen(surf, font, small_font, tick, menu_sel=0, show_credits=Fal
     pygame.draw.line(surf, CYAN, (cx - sep_w // 2, title_y + 88),
                      (cx + sep_w // 2, title_y + 88), 1)
 
-    # ── Botones del menú ──────────────────────────────────────────────────
+    #  Botones del menú 
     mouse_pos = pygame.mouse.get_pos()
     btn_defs = [
-        ("JUGAR",    "Comenzar partida"),
-        ("NIVELES",  "Seleccionar nivel"),
-        ("CONTROLES","Ver controles"),
-        ("SALIR",    "Cerrar el juego"),
+        ("JUGAR",          "Comenzar partida"),
+        ("NIVELES",        "Seleccionar nivel"),
+        ("EDITOR",         "Crear laberinto"),
+        ("CLASIFICACION",  "Mejores tiempos"),
+        ("CONTROLES",      "Ver controles"),
+        ("CONFIGURACION",  "Ajustes del juego"),
+        ("SALIR",          "Cerrar el juego"),
     ]
-    btn_w, btn_h, btn_gap = min(320, panel_w - 80), 46, 10
-    btns_total_h = len(btn_defs) * (btn_h + btn_gap) - btn_gap
-    btn_start_y = title_y + 108
+    btn_w, btn_h, btn_gap = min(320, panel_w - 80), 36, 5
+    btn_start_y = title_y + 104
     btn_x = cx - btn_w // 2
     btn_rects = []
 
@@ -1073,14 +1526,17 @@ def draw_start_screen(surf, font, small_font, tick, menu_sel=0, show_credits=Fal
         surf.blit(hint_s, (btn_x + btn_w - hint_s.get_width() - 10,
                             by + btn_h // 2 - hint_s.get_height() // 2))
 
-    # ── Panel créditos (si está activo) ──────────────────────────────────
+    #  Panel créditos (si está activo) 
     if show_credits:
-        cr_w, cr_h = min(480, W - 80), 220
-        cr_x, cr_y = cx - cr_w // 2, panel_y + panel_h + 14
-        if cr_y + cr_h > H - 10:
-            cr_y = panel_y - cr_h - 14
+        cr_w, cr_h = min(680, W - 40), 260
+        cr_x = cx - cr_w // 2
+        cr_y_below = panel_y + panel_h + 10
+        if cr_y_below + cr_h <= H - 6:
+            cr_y = cr_y_below
+        else:
+            cr_y = panel_y + (panel_h - cr_h) // 2
         crs = pygame.Surface((cr_w, cr_h), pygame.SRCALPHA)
-        crs.fill((0, 15, 25, 220))
+        crs.fill((0, 15, 25, 235))
         surf.blit(crs, (cr_x, cr_y))
         pygame.draw.rect(surf, (0, 80, 120), (cr_x, cr_y, cr_w, cr_h), 2)
         try: hf = pygame.font.SysFont("consolas", 15, bold=True)
@@ -1088,24 +1544,59 @@ def draw_start_screen(surf, font, small_font, tick, menu_sel=0, show_credits=Fal
         ht = hf.render("CONTROLES", True, CYAN)
         surf.blit(ht, (cx - ht.get_width() // 2, cr_y + 12))
         pygame.draw.line(surf, DARK_CYAN, (cr_x + 20, cr_y + 34), (cr_x + cr_w - 20, cr_y + 34), 1)
+        # Player 1 controls
+        try: hf2 = pygame.font.SysFont("consolas", 12, bold=True)
+        except: hf2 = small_font
+        p1_lbl = hf2.render("Jugador 1", True, (60, 200, 120))
+        surf.blit(p1_lbl, (cr_x + 20, cr_y + 40))
         ctrl_lines = [
-            ("WASD / Flechas", "Mover"),
-            ("Shift",          "Caminar en sigilo"),
-            ("Clic Izq",       "Pulso sonar"),
-            ("Clic Der",       "Lanzar señuelo"),
-            ("R",              "Reiniciar"),
-            ("ESC",            "Volver al menú"),
+            ("WASD",           "Mover"),
+            ("Shift",          "Sigilo (sin micro-pulsos)"),
+            ("Clic Izq",       "Pulso sonar 360°"),
+            ("F",              "Sonar en cono (direccional)"),
+            ("Q + Clic",       "Lanzar piedra (ruido a distancia)"),
+            ("E",              "Absorb. de sonido (3 seg)"),
+            ("Clic Der",       "Señuelo sónico"),
+            ("R",              "Reiniciar nivel"),
+            ("ESC",            "Pausa / Menú"),
         ]
-        try: cf2 = pygame.font.SysFont("consolas", 13)
+        try: cf2 = pygame.font.SysFont("consolas", 11)
         except: cf2 = small_font
         for j, (k, v) in enumerate(ctrl_lines):
-            ky = cr_y + 44 + j * 26
+            ky = cr_y + 54 + j * 20
             ks = cf2.render(k, True, (0, 180, 220))
             vs = cf2.render(v, True, (150, 200, 220))
             surf.blit(ks, (cr_x + 20, ky))
-            surf.blit(vs, (cr_x + 180, ky))
+            surf.blit(vs, (cr_x + 110, ky))
+        # ── Nuevas mecánicas column ──────────────────────────────────────────
+        try: hf3 = pygame.font.SysFont("consolas", 11, bold=True)
+        except: hf3 = small_font
+        mech_lbl = hf3.render("Nuevas mecánicas", True, (180, 120, 255))
+        surf.blit(mech_lbl, (cr_x + cr_w // 2 + 10, cr_y + 40))
+        mech_lines = [
+            ("Charcos",        "Ruido moderado al correr"),
+            ("Vidrio roto",    "Ruido masivo al pisar"),
+            ("Zona viento",    "Silencia micro-pulsos"),
+            ("Orbe eco",       "Recolectar lore"),
+            ("Mímico",         "Enemigo oculto en salida"),
+            ("Rastreador",     "Te persigue al oír sonar"),
+            ("Corazón",        "Late si hay alertas"),
+        ]
+        try: mf2 = pygame.font.SysFont("consolas", 11)
+        except: mf2 = small_font
+        for j, (k, v) in enumerate(mech_lines):
+            ky = cr_y + 54 + j * 20
+            ks = mf2.render(k, True, (180, 100, 255))
+            vs = mf2.render(v, True, (160, 140, 200))
+            surf.blit(ks, (cr_x + cr_w // 2 + 10, ky))
+            surf.blit(vs, (cr_x + cr_w // 2 + 110, ky))
+        # Co-op footer 
+        try: cf3 = pygame.font.SysFont("consolas", 11)
+        except: cf3 = small_font
+        tip_c = cf3.render("Jugador 2 (co-op): Flechas + RShift  |  C en nivel: activar co-op", True, (80, 130, 100))
+        surf.blit(tip_c, (cr_x + 20, cr_y + cr_h - 22))
 
-    # ── Recuadro de créditos (esquina inferior izquierda) ─────────────────
+    #  Recuadro de créditos (esquina inferior izquierda) 
     try:
         cr_lbl_f = pygame.font.SysFont("consolas", 11, bold=True)
         cr_val_f = pygame.font.SysFont("consolas", 11)
@@ -1114,7 +1605,7 @@ def draw_start_screen(surf, font, small_font, tick, menu_sel=0, show_credits=Fal
 
     credits_lines = [
         ("Diseño y código",  "Andres Carrillo"),
-        ("Motor",            "Pygame 2 / Python 3"),
+        ("Github",            "AndresCarrillo444"),
         ("Género",           "Sigilo · Sonar"),
         ("Versión",          "1.0  —  2026"),
     ]
@@ -1165,26 +1656,29 @@ def draw_start_screen(surf, font, small_font, tick, menu_sel=0, show_credits=Fal
         surf.blit(ls, (cr_x + 10, ly))
         surf.blit(vs, (cr_x + 10 + ls.get_width() + 4, ly))
 
-    # ── Tip inferior ─────────────────────────────────────────────────────
+    # Tip inferior 
     try: tip_f = pygame.font.SysFont("consolas", 12)
     except: tip_f = small_font
     tip = tip_f.render("Flechas: navegar  |  Enter: seleccionar  |  ESC: salir", True, (40, 65, 80))
     surf.blit(tip, (cx - tip.get_width() // 2, H - 18))
 
-    # ── Versión ───────────────────────────────────────────────────────────
+    #  Versión 
     ver = tip_f.render("v2.0  |  ECO-CEGUERA", True, (25, 45, 60))
     surf.blit(ver, (panel_x + panel_w - ver.get_width() - 6, panel_y + panel_h - 18))
 
-    # Retorna los 4 rects (jugar, niveles, controles, salir)
-    while len(btn_rects) < 4:
+    # Returns 7 rects (jugar, niveles, editor, clasificacion, controles, config, salir)
+    while len(btn_rects) < 7:
         btn_rects.append(pygame.Rect(0, 0, 0, 0))
-    return tuple(btn_rects[:4])
+    return tuple(btn_rects[:7])
 
 
 #  Pantalla de selección de nivel 
+def draw_level_select(surf, tick, sel, max_unlocked, font, small_font,
+                      ls_tab="normal", custom_sel=0, custom_names=None,
+                      coop_enabled=False):
+    if custom_names is None:
+        custom_names = []
 
-def draw_level_select(surf, tick, sel, max_unlocked, font, small_font):
-    """Renders level select. Returns (card_rects, play_rect)."""
     surf.fill(BLACK)
     cx = W // 2
     for i in range(4):
@@ -1196,92 +1690,207 @@ def draw_level_select(surf, tick, sel, max_unlocked, font, small_font):
     for gx in range(0, W, TILE): pygame.draw.line(surf, (8,15,20), (gx,0), (gx,H))
     for gy in range(0, H, TILE): pygame.draw.line(surf, (8,15,20), (0,gy), (W,gy))
 
-    try:  tf = pygame.font.SysFont("consolas", 30, bold=True)
+    try:  tf = pygame.font.SysFont("consolas", 28, bold=True)
     except: tf = font
     gv = int(160 + 80*(math.sin(tick*0.05)*0.5+0.5))
     ts = tf.render("SELECCIONAR NIVEL", True, (0, gv, gv))
-    surf.blit(ts, (cx - ts.get_width()//2, 18))
+    surf.blit(ts, (cx - ts.get_width()//2, 14))
 
-    card_w, card_h, gap = 780, 72, 8
-    card_x = cx - card_w // 2
-    card_y0 = 66
-    mouse   = pygame.mouse.get_pos()
-    card_rects = []
-    mech_labels = {'timer':'CRONOMETRO', 'respawn_traps':'TRAMPAS VIVAS', 'blackout':'APAGON'}
+    # Tab bar
+    tab_y, tab_w2, tab_h2 = 50, 160, 28
+    mouse = pygame.mouse.get_pos()
+    tab_normal_r = pygame.Rect(cx - tab_w2 - 4, tab_y, tab_w2, tab_h2)
+    tab_custom_r = pygame.Rect(cx + 4,           tab_y, tab_w2, tab_h2)
 
-    for i, cfg in enumerate(LEVEL_CONFIGS):
-        cy2  = card_y0 + i * (card_h + gap)
-        rect = pygame.Rect(card_x, cy2, card_w, card_h)
-        card_rects.append(rect)
-        locked   = i > max_unlocked
-        hovered  = rect.collidepoint(mouse) and not locked
-        selected = (i == sel)
+    try:  tf2 = pygame.font.SysFont("consolas", 13, bold=True)
+    except: tf2 = small_font
 
-        bg_a = 200 if selected else 160
-        bg_r, bg_g, bg_b = (0,40,60) if selected else (5,20,30)
-        cs = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
-        cs.fill((bg_r, bg_g, bg_b, bg_a if not locked else 80))
-        surf.blit(cs, (card_x, cy2))
+    for r, label, active, col in [
+        (tab_normal_r, "NIVELES",     ls_tab == "normal", (0, 100, 50)),
+        (tab_custom_r, "MIS NIVELES", ls_tab == "custom", (0, 50, 130)),
+    ]:
+        bg = (*col, 230) if active else (*(c//2 for c in col), 140)
+        bst = pygame.Surface((tab_w2, tab_h2), pygame.SRCALPHA)
+        bst.fill(bg)
+        surf.blit(bst, r.topleft)
+        border = tuple(min(255, c + 60) for c in col) if active else col
+        pygame.draw.rect(surf, border, r, 2)
+        ls2 = tf2.render(label, True, WHITE if active else (140,170,190))
+        surf.blit(ls2, (r.centerx - ls2.get_width()//2, r.centery - ls2.get_height()//2))
 
-        if selected and not locked:
-            bv = int(130 + 110*(math.sin(tick*0.1)*0.5+0.5))
-            border = (0, bv, 255)
-        elif hovered: border = (0,110,170)
-        elif locked:  border = (25,35,45)
-        else:         border = (0,55,75)
-        pygame.draw.rect(surf, border, rect, 2)
+    card_y0 = tab_y + tab_h2 + 10
 
-        # Badge number
-        bc = (0,80,110) if selected and not locked else (40,50,60) if locked else (0,50,70)
-        pygame.draw.rect(surf, bc, (card_x+6, cy2+6, 54, card_h-12))
-        ns = font.render(f"{i+1}", True, (70,80,90) if locked else CYAN)
-        surf.blit(ns, (card_x+6+27-ns.get_width()//2, cy2+card_h//2-ns.get_height()//2))
+    # CO-OP status badge 
+    try: cof = pygame.font.SysFont("consolas", 12, bold=True)
+    except: cof = small_font
+    co_on  = coop_enabled
+    co_txt = "[ CO-OP: ON  ]" if co_on else "[ CO-OP: OFF ]"
+    co_col = (0, 200, 100) if co_on else (80, 90, 100)
+    co_bg  = (0, 60, 30, 200) if co_on else (20, 25, 30, 160)
+    co_s   = cof.render(co_txt, True, co_col)
+    co_bw, co_bh = co_s.get_width() + 14, 22
+    co_bx, co_by = cx + tab_w2 + 14, tab_y + (tab_h2 - co_bh) // 2
+    cobs = pygame.Surface((co_bw, co_bh), pygame.SRCALPHA)
+    cobs.fill(co_bg)
+    surf.blit(cobs, (co_bx, co_by))
+    pygame.draw.rect(surf, co_col, (co_bx, co_by, co_bw, co_bh), 1)
+    surf.blit(co_s, (co_bx + 7, co_by + co_bh//2 - co_s.get_height()//2))
+    key_hint = cof.render("C: activar/desactivar", True, (50, 80, 60) if not co_on else (40, 120, 70))
+    surf.blit(key_hint, (co_bx, co_by + co_bh + 3))
 
-        # Name
-        nc = (35,45,55) if locked else (WHITE if selected else (170,205,225))
-        try: nf = pygame.font.SysFont("consolas",17,bold=True)
-        except: nf = small_font
-        nm = nf.render(("[BLOQUEADO]  " if locked else "") + cfg['name'], True, nc)
-        surf.blit(nm, (card_x+70, cy2+9))
-        sc = (25,35,45) if locked else (100,145,165)
-        ss = small_font.render(cfg['subtitle'], True, sc)
-        surf.blit(ss, (card_x+70, cy2+34))
 
-        mech = cfg.get('mechanic')
-        if mech and not locked:
-            ml = small_font.render(mech_labels.get(mech,''), True, ORANGE)
-            surf.blit(ml, (card_x+card_w-ml.get_width()-10, cy2+card_h//2-ml.get_height()//2))
+    # Placeholders so return tuple is always complete
+    card_rects        = []
+    play_rect         = pygame.Rect(0,0,0,0)
+    custom_card_rects = []
+    custom_play_r     = pygame.Rect(0,0,0,0)
+    custom_del_r      = pygame.Rect(0,0,0,0)
 
-    # PLAY button
-    py0 = card_y0 + N_LEVELS*(card_h+gap) + 10
-    play_rect = pygame.Rect(cx-110, py0, 220, 44)
-    can_play  = sel <= max_unlocked
-    ph = play_rect.collidepoint(mouse) and can_play
-    pc = (0,210,255) if ph else ((0,140,180) if can_play else (40,50,60))
-    ps = pygame.Surface((220,44), pygame.SRCALPHA)
-    ps.fill((*pc, 210 if ph else 140))
-    surf.blit(ps, (cx-110, py0))
-    pygame.draw.rect(surf, pc, play_rect, 2)
-    try: bf = pygame.font.SysFont("consolas",18,bold=True)
-    except: bf = font
-    bl = bf.render(">> JUGAR <<" if ph else "[ JUGAR ]", True, WHITE if can_play else (60,70,80))
-    surf.blit(bl, (cx-bl.get_width()//2, py0+22-bl.get_height()//2))
+    if ls_tab == "normal":
+        # Built-in levels 
+        card_w, card_h2, gap = 780, 46, 4
+        card_x = cx - card_w // 2
+        mech_labels = {'timer':'CRONOMETRO','respawn_traps':'TRAMPAS VIVAS','blackout':'APAGON'}
 
-    tip = small_font.render("Click en un nivel para seleccionar  |  ESC: menu principal", True, (55,80,95))
-    surf.blit(tip, (cx-tip.get_width()//2, H-22))
-    return card_rects, play_rect
+        for i, cfg in enumerate(LEVEL_CONFIGS):
+            cy2   = card_y0 + i * (card_h2 + gap)
+            rect  = pygame.Rect(card_x, cy2, card_w, card_h2)
+            card_rects.append(rect)
+            locked   = i > max_unlocked
+            hovered  = rect.collidepoint(mouse) and not locked
+            selected = (i == sel)
+
+            cs = pygame.Surface((card_w, card_h2), pygame.SRCALPHA)
+            cs.fill((0,40,60,200) if selected else (5,20,30,160) if not locked else (5,10,15,80))
+            surf.blit(cs, (card_x, cy2))
+
+            if selected and not locked:
+                bv = int(130 + 110*(math.sin(tick*0.1)*0.5+0.5))
+                border = (0, bv, 255)
+            elif hovered: border = (0,110,170)
+            elif locked:  border = (25,35,45)
+            else:         border = (0,55,75)
+            pygame.draw.rect(surf, border, rect, 2)
+
+            bc = (0,80,110) if selected and not locked else (40,50,60) if locked else (0,50,70)
+            pygame.draw.rect(surf, bc, (card_x+6, cy2+6, 50, card_h2-12))
+            ns = font.render(f"{i+1}", True, (70,80,90) if locked else CYAN)
+            surf.blit(ns, (card_x+6+25-ns.get_width()//2, cy2+card_h2//2-ns.get_height()//2))
+
+            nc = (35,45,55) if locked else (WHITE if selected else (170,205,225))
+            try: nf = pygame.font.SysFont("consolas",15,bold=True)
+            except: nf = small_font
+            nm = nf.render(("[BLOQUEADO]  " if locked else "") + cfg['name'], True, nc)
+            surf.blit(nm, (card_x+64, cy2+6))
+            ss = small_font.render(cfg['subtitle'], True, (25,35,45) if locked else (100,145,165))
+            surf.blit(ss, (card_x+64, cy2+24))
+
+            mech = cfg.get('mechanic')
+            if mech and not locked:
+                ml = small_font.render(mech_labels.get(mech,''), True, ORANGE)
+                surf.blit(ml, (card_x+card_w-ml.get_width()-8, cy2+card_h2//2-ml.get_height()//2))
+
+        py0 = card_y0 + N_LEVELS*(card_h2+gap) + 8
+        play_rect = pygame.Rect(cx-110, py0, 220, 40)
+        can_play  = sel <= max_unlocked
+        ph = play_rect.collidepoint(mouse) and can_play
+        pc = (0,210,255) if ph else ((0,140,180) if can_play else (40,50,60))
+        ps2 = pygame.Surface((220,40), pygame.SRCALPHA)
+        ps2.fill((*pc, 210 if ph else 140))
+        surf.blit(ps2, play_rect.topleft)
+        pygame.draw.rect(surf, pc, play_rect, 2)
+        try: bf = pygame.font.SysFont("consolas",16,bold=True)
+        except: bf = font
+        bl = bf.render(">> JUGAR <<" if ph else "[ JUGAR ]", True, WHITE if can_play else (60,70,80))
+        surf.blit(bl, (cx-bl.get_width()//2, py0+20-bl.get_height()//2))
+
+        try: cf3 = pygame.font.SysFont("consolas",11)
+        except: cf3 = small_font
+        surf.blit(cf3.render("C: co-op ON/OFF", True, (50,90,60)), (cx-60, py0+46))
+
+    else:
+        # Custom levels tab 
+        card_w, card_h2, gap = 780, 46, 4
+        card_x = cx - card_w // 2
+
+        if not custom_names:
+            try: ef = pygame.font.SysFont("consolas",14)
+            except: ef = small_font
+            surf.blit(ef.render("No tienes niveles guardados todavía.", True, (80,110,130)),
+                      (cx - ef.size("No tienes niveles guardados todavía.")[0]//2, card_y0+30))
+            surf.blit(ef.render("Ve al EDITOR → pinta tu laberinto → GUARDAR", True, (60,90,110)),
+                      (cx - ef.size("Ve al EDITOR → pinta tu laberinto → GUARDAR")[0]//2, card_y0+56))
+        else:
+            for i, name in enumerate(custom_names):
+                cy2  = card_y0 + i * (card_h2 + gap)
+                rect = pygame.Rect(card_x, cy2, card_w - 60, card_h2)
+                custom_card_rects.append(rect)
+                selected = (i == custom_sel)
+                hovered  = rect.collidepoint(mouse)
+
+                cs = pygame.Surface((card_w-60, card_h2), pygame.SRCALPHA)
+                cs.fill((0,25,50,200) if selected else (5,15,30,160))
+                surf.blit(cs, (card_x, cy2))
+                if selected:
+                    bv = int(100+130*(math.sin(tick*0.1)*0.5+0.5))
+                    border = (0, bv, min(255,bv+80))
+                elif hovered: border = (0,80,150)
+                else:         border = (0,40,80)
+                pygame.draw.rect(surf, border, rect, 2)
+
+                pygame.draw.rect(surf, (0,40,80), (card_x+6, cy2+6, 40, card_h2-12))
+                try: nf2 = pygame.font.SysFont("consolas",12,bold=True)
+                except: nf2 = small_font
+                ns2 = nf2.render(str(i+1), True, (0,160,220))
+                surf.blit(ns2, (card_x+6+20-ns2.get_width()//2, cy2+card_h2//2-ns2.get_height()//2))
+
+                try: cnf = pygame.font.SysFont("consolas",14,bold=True)
+                except: cnf = small_font
+                cn_s = cnf.render(name, True, WHITE if selected else (160,200,230))
+                surf.blit(cn_s, (card_x+54, cy2+card_h2//2-cn_s.get_height()//2))
+
+                del_r = pygame.Rect(card_x+card_w-54, cy2+(card_h2-24)//2, 50, 24)
+                dh = del_r.collidepoint(mouse)
+                ds = pygame.Surface((50,24), pygame.SRCALPHA)
+                ds.fill((120,0,0,200) if dh else (60,0,0,140))
+                surf.blit(ds, del_r.topleft)
+                pygame.draw.rect(surf, (200,0,0) if dh else (80,0,0), del_r, 1)
+                try: df = pygame.font.SysFont("consolas",11,bold=True)
+                except: df = small_font
+                dl = df.render("DEL", True, (255,80,80))
+                surf.blit(dl, (del_r.centerx-dl.get_width()//2, del_r.centery-dl.get_height()//2))
+                if selected:
+                    custom_del_r = del_r
+
+            py0 = card_y0 + len(custom_names)*(card_h2+gap) + 8
+            custom_play_r = pygame.Rect(cx-110, py0, 220, 40)
+            can_p = 0 <= custom_sel < len(custom_names)
+            ph2 = custom_play_r.collidepoint(mouse) and can_p
+            pc2 = (0,160,255) if ph2 else ((0,90,180) if can_p else (40,50,60))
+            ps3 = pygame.Surface((220,40), pygame.SRCALPHA)
+            ps3.fill((*pc2, 210 if ph2 else 140))
+            surf.blit(ps3, custom_play_r.topleft)
+            pygame.draw.rect(surf, pc2, custom_play_r, 2)
+            try: bf2 = pygame.font.SysFont("consolas",16,bold=True)
+            except: bf2 = font
+            bl2 = bf2.render(">> JUGAR <<" if ph2 else "[ JUGAR ]",
+                              True, WHITE if can_p else (60,70,80))
+            surf.blit(bl2, (cx-bl2.get_width()//2, py0+20-bl2.get_height()//2))
+
+    surf.blit(small_font.render("Click: seleccionar  |  ESC: menu principal", True, (55,80,95)),
+              (cx - small_font.size("Click: seleccionar  |  ESC: menu principal")[0]//2, H-18))
+    return (card_rects, play_rect, tab_normal_r, tab_custom_r,
+            custom_card_rects, custom_play_r, custom_del_r)
 
 
 def draw_level_complete(surf, tick, font, level_idx, score=0, pulse_count=0, elapsed_ticks=0):
     """Overlay shown when the player escapes. Returns continue_rect."""
     cx, cy = W//2, H//2
 
-    # Fondo oscuro verde
     ov = pygame.Surface((W, H), pygame.SRCALPHA)
     ov.fill((0, 20, 8, 200))
     surf.blit(ov, (0, 0))
 
-    # Anillos expansivos de victoria
     for i in range(6):
         phase = (tick * 1.2 + i * 52) % 360
         rad = int((phase / 360) * max(W, H) * 0.75)
@@ -1290,7 +1899,6 @@ def draw_level_complete(surf, tick, font, level_idx, score=0, pulse_count=0, ela
         if rad > 0:
             pygame.draw.circle(surf, col, (cx, cy), rad, 1)
 
-    # Panel glassmorphism
     pw, ph2 = min(540, W - 60), 300
     px2, py2 = cx - pw//2, cy - ph2//2
     ps = pygame.Surface((pw, ph2), pygame.SRCALPHA)
@@ -1302,7 +1910,6 @@ def draw_level_complete(surf, tick, font, level_idx, score=0, pulse_count=0, ela
     for qx, qy in [(px2, py2), (px2+pw-csz, py2), (px2, py2+ph2-csz), (px2+pw-csz, py2+ph2-csz)]:
         pygame.draw.rect(surf, (0, 220, 100), (qx, qy, csz, csz), 2)
 
-    # Título
     try: tf = pygame.font.SysFont("consolas", 40, bold=True)
     except: tf = font
     gv = int(150 + 100*(math.sin(tick*0.08)*0.5+0.5))
@@ -1311,7 +1918,6 @@ def draw_level_complete(surf, tick, font, level_idx, score=0, pulse_count=0, ela
     t1 = tf.render("NIVEL COMPLETADO", True, (0, gv, int(gv*0.45)))
     surf.blit(t1, (cx - t1.get_width()//2, py2 + 22))
 
-    # Separador
     pygame.draw.line(surf, (0, 80, 40), (px2+24, py2+82), (px2+pw-24, py2+82), 1)
     sep_w = int((pw-48) * min(1.0, tick/60))
     pygame.draw.line(surf, GREEN, (cx - sep_w//2, py2+82), (cx + sep_w//2, py2+82), 1)
@@ -1320,29 +1926,26 @@ def draw_level_complete(surf, tick, font, level_idx, score=0, pulse_count=0, ela
     try: sf = pygame.font.SysFont("consolas", 15)
     except: sf = font
 
-    # Nombre del nivel
     n2 = sf.render(f"Nivel {level_idx+1}  —  {cfg['name']}", True, (120, 220, 150))
     surf.blit(n2, (cx - n2.get_width()//2, py2 + 98))
 
-    # Siguiente nivel
     is_last = level_idx >= N_LEVELS - 1
     next_txt = "¡Has completado el juego!" if is_last else f"Siguiente:  {LEVEL_CONFIGS[level_idx+1]['name']}"
     nx_col = GOLD if is_last else (100, 180, 130)
     nx = sf.render(next_txt, True, nx_col)
     surf.blit(nx, (cx - nx.get_width()//2, py2 + 112))
 
-    # Desglose de puntuación
     time_bonus = max(0, 3000 - elapsed_ticks // 2)
     pulse_pen  = pulse_count * 80
     lvl_bonus  = level_idx * 500
     try: bf2 = pygame.font.SysFont("consolas", 13)
     except: bf2 = sf
     score_lines = [
-        ("Base",         5000,       CYAN),
-        ("Velocidad",    time_bonus, GREEN),
-        ("Pulsos  -",    pulse_pen,  ORANGE),
-        ("Nivel   +",    lvl_bonus,  GOLD),
-        ("TOTAL",        score,      WHITE),
+        ("Base",      5000,      CYAN),
+        ("Velocidad", time_bonus, GREEN),
+        ("Pulsos  -", pulse_pen,  ORANGE),
+        ("Nivel   +", lvl_bonus,  GOLD),
+        ("TOTAL",     score,      WHITE),
     ]
     sc_y = py2 + 140
     pygame.draw.line(surf, (0,60,40), (px2+24, sc_y-4), (px2+pw-24, sc_y-4), 1)
@@ -1354,7 +1957,6 @@ def draw_level_complete(surf, tick, font, level_idx, score=0, pulse_count=0, ela
         sc_y += 18
     pygame.draw.line(surf, (0,60,40), (px2+24, sc_y-2), (px2+pw-24, sc_y-2), 1)
 
-    # Botón CONTINUAR
     mouse = pygame.mouse.get_pos()
     cont = pygame.Rect(cx - 140, py2 + ph2 - 68, 280, 46)
     mh   = cont.collidepoint(mouse)
@@ -1409,8 +2011,11 @@ def draw_hud(surf, font, small_font, decoys, alert_count, caught, won, level_idx
         alert_txt = small_font.render(f"! {alert_count} enemigo(s) en alerta !", True, ORANGE)
         surf.blit(alert_txt, (W//2 - alert_txt.get_width()//2, 8))
 
-    controls = small_font.render("WASD: mover  |  Shift: sigilo  |  Clic Izq: sonar  |  R: reiniciar  |  ESC: menu", True, (80, 120, 140))
+    controls = small_font.render(
+        "WASD:mover  Shift:sigilo  Clic:sonar  F:cono  Q:roca  E:absorb  Clic-Der:señuelo  R:reset",
+        True, (80, 120, 140))
     surf.blit(controls, (12, H - 22))
+
 
     if caught:
         cx2, cy2 = W // 2, H // 2
@@ -1478,14 +2083,12 @@ def draw_hud(surf, font, small_font, decoys, alert_count, caught, won, level_idx
         tip2 = tip_f2.render("R: reintentar  |  ESC: menú", True, (100, 30, 30))
         surf.blit(tip2, (cx2 - tip2.get_width()//2, py3 + ph3 - 14))
 
-
-
 #  Loop principal 
 
 async def main():
     global W, H
     pygame.init()
-    _init_sounds()
+    audio_init()
     clock = pygame.time.Clock()
     pygame.display.set_caption("Eco-Ceguera")
     IS_WEB = sys.platform == 'emscripten'
@@ -1497,7 +2100,7 @@ async def main():
         font       = pygame.font.Font(None, 24)
         small_font = pygame.font.Font(None, 16)
 
-    # ── Resolution setup ──────────────────────────────────────────────────
+    # Resolution setup 
     if IS_WEB:
         try:
             info = pygame.display.Info()
@@ -1534,11 +2137,11 @@ async def main():
     VIEW_W  = W
     VIEW_H  = H - HUD_TOP - 24
 
-    # ── Progression ───────────────────────────────────────────────────────
+    #  Progression 
     current_level = 0
     max_unlocked  = 0
 
-    # ── Game state placeholders ───────────────────────────────────────────
+    #  Game state placeholders 
     walls = enemies = player = pulses = exit_rect = traps = wall_grid = None
     decoys = micro_pulse_timer = tick = 0
     lv_timer = trap_respawn_cd = blackout_cd = 0
@@ -1551,6 +2154,53 @@ async def main():
     game_ticks = 0
     sfx_played = False   # evita repetir el sonido de victoria/derrota
 
+    #  New feature state
+    lb_tick       = 0                               # leaderboard animation tick
+    editor_grid   = empty_editor_grid(COLS, ROWS)  # level editor grid
+    editor_sel    = 0                               # selected palette index
+    editor_tick   = 0
+    player2       = None                            # co-op second player
+    coop_enabled  = False                           # toggle in level select (C key)
+    # name-input state (shown only on new record)
+    name_buf      = ""    # text typed by the player
+    ni_tick       = 0     # animation tick for name-input screen
+    lb_tab        = "local"   # leaderboard tab: 'local' or 'global'
+    ls_tab        = "normal"  # level-select tab: 'normal' or 'custom'
+    custom_sel    = 0         # selected index in custom levels list
+    custom_names  = custom_levels_list()  # names of saved custom levels
+    # pause state
+    paused        = False         # True while pause menu is open
+    pause_tick    = 0             # animation tick inside the pause menu
+    pause_origin  = 'ls'          # 'ls' or 'editor' — where to go on "exit"
+    # Progreso y Settings
+    global cfg_settings
+    cfg_settings  = settings_load()
+    settings_open = False
+    settings_tick = 0
+    # fog-of-war memory surface (persistent dim wall outlines)
+    fog_surf      = None          # created per-level in new_game helper
+    # particle death burst
+    death_particles = []          # list of dicts {x,y,vx,vy,life,max_life,color}
+    # level transition fade
+    fade_alpha    = 0             # 0=fully visible, 255=black; negative triggers fade-in
+    fade_dir      = 0             # +1=fade out, -1=fade in, 0=idle
+    fade_target   = None          # state to switch to after fade-out
+    # editor save dialog
+    editor_save_open  = False
+    editor_save_buf   = ""
+    editor_save_tick  = 0
+    micro_pulse_timer2 = 0   # co-op player2 movement sonar throttle
+    # NEW feature state
+    floor_hazards  = []        # FloorHazard list
+    noise_zones    = []        # NoiseZone list
+    echo_orbs      = []        # EchoOrb list
+    rocks          = []        # ThrowableRock list in flight
+    absorber       = SoundAbsorber()
+    rock_mode      = False     # True while Q held — next click throws rock
+    heartbeat_t    = 0         # frames until next heartbeat visual
+    mimics         = []        # MimicEnemy list (subset of enemies list for sonar checks)
+    stalkers       = []        # StalkerEnemy list (for sonar-heard notification)
+
     def new_game(level):
         global REVEAL_DURATION, SONAR_MAX_RADIUS, MICRO_PULSE_INTERVAL
         global ENEMY_SPEED_BASE, ENEMY_ALERT_SPEED
@@ -1560,12 +2210,13 @@ async def main():
         MICRO_PULSE_INTERVAL = cfg['micro_interval']
         ENEMY_SPEED_BASE     = round(cfg['spd_mult'] * 0.9, 2)
         ENEMY_ALERT_SPEED    = round(cfg['spd_mult'] * 2.2, 2)
-        w2, e2, ppos, ex, tr, wg = build_map(cfg)
+        w2, e2, ppos, ex, tr, wg, fh, nz, eo = build_map(cfg)
         m   = cfg.get('mechanic')
         lt  = cfg.get('timer_secs', 0) * FPS if m == 'timer' else 0
         trc = cfg.get('respawn_frames', 900) if m == 'respawn_traps' else 0
         bc  = cfg.get('blackout_interval', 900) if m == 'blackout' else 0
-        return (w2, e2, Player(*ppos), [], DECOY_COUNT, 0, ex, tr, 0, wg, lt, trc, bc, m, cfg)
+        return (w2, e2, Player(*ppos), [], DECOY_COUNT, 0, ex, tr, 0, wg,
+                lt, trc, bc, m, cfg, fh, nz, eo, SoundAbsorber())
 
     def calc_score(elapsed_ticks, pulses_used, level):
         """Calcula la puntuación al completar un nivel."""
@@ -1575,7 +2226,7 @@ async def main():
         level_bonus = level * 500
         return max(0, base + time_bonus - pulse_pen + level_bonus)
 
-    # ── Main async loop ───────────────────────────────────────────────────
+    #  Main async loop 
     running = True
     while running:
         clock.tick(FPS)
@@ -1589,7 +2240,7 @@ async def main():
         if not running:
             break
 
-        # ════ RESOLUTION PICKER ══════════════════════════════════════════
+        # RESOLUTION PICKER 
         if state == 'res':
             res_tick += 1
             for ev in events:
@@ -1629,93 +2280,197 @@ async def main():
             pygame.display.flip()
             await asyncio.sleep(0); continue
 
-        # ════ INTRO ══════════════════════════════════════════════════════
+        # INTRO
         if state == 'intro':
             intro_tick += 1
-            _MENU_OPTS = 4  # Jugar, Niveles, Controles, Salir
+            _MENU_OPTS = 7  # Jugar, Niveles, Editor, Clasificacion, Controles, Config, Salir
             for ev in events:
                 if ev.type == pygame.KEYDOWN:
                     if ev.key == pygame.K_ESCAPE:
-                        pygame.quit(); sys.exit()
-                    if ev.key == pygame.K_UP:
-                        menu_sel = (menu_sel - 1) % _MENU_OPTS
-                        show_credits = False
-                    if ev.key == pygame.K_DOWN:
-                        menu_sel = (menu_sel + 1) % _MENU_OPTS
-                        show_credits = False
-                    if ev.key in (pygame.K_RETURN, pygame.K_SPACE):
-                        if menu_sel == 0:   # Jugar
-                            state = 'ls'
-                        elif menu_sel == 1: # Niveles
-                            state = 'ls'
-                        elif menu_sel == 2: # Controles
-                            show_credits = not show_credits
-                        elif menu_sel == 3: # Salir
+                        if settings_open:
+                            settings_save(cfg_settings)
+                            sfx_set_volume(cfg_settings.get('sfx_volume', 0.55))
+                            music_set_volume(cfg_settings.get('music_volume', 0.45))
+                            settings_open = False
+                        else:
                             pygame.quit(); sys.exit()
+                    if not settings_open:
+                        if ev.key == pygame.K_UP:
+                            menu_sel = (menu_sel - 1) % _MENU_OPTS
+                            show_credits = False
+                        if ev.key == pygame.K_DOWN:
+                            menu_sel = (menu_sel + 1) % _MENU_OPTS
+                            show_credits = False
+                        if ev.key in (pygame.K_RETURN, pygame.K_SPACE):
+                            if menu_sel == 0:   state = 'ls'
+                            elif menu_sel == 1: state = 'ls'
+                            elif menu_sel == 2: state = 'editor'
+                            elif menu_sel == 3: state = 'lb'; lb_tick = 0
+                            elif menu_sel == 4: show_credits = not show_credits
+                            elif menu_sel == 5: settings_open = True; settings_tick = 0
+                            elif menu_sel == 6: pygame.quit(); sys.exit()
                 if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                    rects = draw_start_screen(screen, font, small_font, intro_tick, menu_sel, show_credits)
-                    if rects[0].collidepoint(ev.pos):   # Jugar
-                        state = 'ls'
-                    elif rects[1].collidepoint(ev.pos): # Niveles
-                        state = 'ls'
-                    elif rects[2].collidepoint(ev.pos): # Controles
-                        show_credits = not show_credits
-                    elif rects[3].collidepoint(ev.pos): # Salir
-                        pygame.quit(); sys.exit()
+                    if settings_open:
+                        s_rects = draw_settings_menu(screen, font, small_font, settings_tick,
+                                                     cfg_settings, BLACK=BLACK, CYAN=CYAN,
+                                                     WHITE=WHITE, GREEN=GREEN, GOLD=GOLD)
+                        if s_rects['sfx_up'].collidepoint(ev.pos):
+                            cfg_settings['sfx_volume'] = min(1.0, round(cfg_settings['sfx_volume'] + 0.1, 1))
+                        elif s_rects['sfx_down'].collidepoint(ev.pos):
+                            cfg_settings['sfx_volume'] = max(0.0, round(cfg_settings['sfx_volume'] - 0.1, 1))
+                        elif s_rects['hc_toggle'].collidepoint(ev.pos):
+                            cfg_settings['high_contrast'] = not cfg_settings['high_contrast']
+                        elif s_rects['trail_toggle'].collidepoint(ev.pos):
+                            cfg_settings['show_trail'] = not cfg_settings['show_trail']
+                        elif s_rects['back'].collidepoint(ev.pos):
+                            settings_save(cfg_settings)
+                            sfx_set_volume(cfg_settings.get('sfx_volume', 0.55))
+                            music_set_volume(cfg_settings.get('music_volume', 0.45))
+                            settings_open = False
                     else:
-                        for i, r in enumerate(rects):
-                            if r.collidepoint(ev.pos):
-                                menu_sel = i
+                        rects = draw_start_screen(screen, font, small_font, intro_tick, menu_sel, show_credits)
+                        if   rects[0].collidepoint(ev.pos): state = 'ls'
+                        elif rects[1].collidepoint(ev.pos): state = 'ls'
+                        elif rects[2].collidepoint(ev.pos): state = 'editor'
+                        elif rects[3].collidepoint(ev.pos): state = 'lb'; lb_tick = 0
+                        elif rects[4].collidepoint(ev.pos): show_credits = not show_credits
+                        elif rects[5].collidepoint(ev.pos): settings_open = True; settings_tick = 0
+                        elif rects[6].collidepoint(ev.pos): pygame.quit(); sys.exit()
+                        else:
+                            for i, r in enumerate(rects):
+                                if r.collidepoint(ev.pos):
+                                    menu_sel = i
                 if ev.type == pygame.FINGERDOWN:
                     sx, sy = int(ev.x * W), int(ev.y * H)
                     rects = draw_start_screen(screen, font, small_font, intro_tick, menu_sel, show_credits)
-                    if rects[0].collidepoint((sx,sy)): state = 'ls'
+                    if   rects[0].collidepoint((sx,sy)): state = 'ls'
                     elif rects[1].collidepoint((sx,sy)): state = 'ls'
-                    elif rects[2].collidepoint((sx,sy)): show_credits = not show_credits
-                    elif rects[3].collidepoint((sx,sy)): pygame.quit(); sys.exit()
+                    elif rects[2].collidepoint((sx,sy)): state = 'editor'
+                    elif rects[3].collidepoint((sx,sy)): state = 'lb'; lb_tick = 0
+                    elif rects[4].collidepoint((sx,sy)): show_credits = not show_credits
+                    elif rects[5].collidepoint((sx,sy)): settings_open = True; settings_tick = 0
+                    elif rects[6].collidepoint((sx,sy)): pygame.quit(); sys.exit()
             draw_start_screen(screen, font, small_font, intro_tick, menu_sel, show_credits)
+            if settings_open:
+                settings_tick += 1
+                draw_settings_menu(screen, font, small_font, settings_tick, cfg_settings,
+                                   BLACK=BLACK, CYAN=CYAN, WHITE=WHITE, GREEN=GREEN, GOLD=GOLD)
+            music_set_state('menu')
             pygame.display.flip()
             await asyncio.sleep(0); continue
 
-        # ════ LEVEL SELECT ════════════════════════════════════════════════
+        #  LEVEL SELECT
         if state == 'ls':
             ls_tick += 1
+
+            def _ls_draw():
+                return draw_level_select(screen, ls_tick, current_level, max_unlocked,
+                                         font, small_font,
+                                         ls_tab=ls_tab, custom_sel=custom_sel,
+                                         custom_names=custom_names,
+                                         coop_enabled=coop_enabled)
+
+            def _launch_normal():
+                nonlocal walls, enemies, player, pulses, decoys, tick, exit_rect
+                nonlocal traps, micro_pulse_timer, wall_grid
+                nonlocal lv_timer, trap_respawn_cd, blackout_cd, mech, active_cfg
+                nonlocal score, pulse_count, game_ticks, sfx_played, player2, paused
+                nonlocal pause_origin, state
+                nonlocal floor_hazards, noise_zones, echo_orbs, rocks, absorber
+                nonlocal rock_mode, heartbeat_t, mimics, stalkers
+                (walls, enemies, player, pulses, decoys, tick, exit_rect,
+                 traps, micro_pulse_timer, wall_grid,
+                 lv_timer, trap_respawn_cd, blackout_cd, mech, active_cfg,
+                 floor_hazards, noise_zones, echo_orbs, absorber) = new_game(current_level)
+                mimics   = [e for e in enemies if isinstance(e, MimicEnemy)]
+                stalkers = [e for e in enemies if isinstance(e, StalkerEnemy)]
+                rocks = []; rock_mode = False; heartbeat_t = 0
+                score = 0; pulse_count = 0; game_ticks = 0; sfx_played = False
+                player2 = Player2(player.x + TILE, player.y) if coop_enabled else None
+                paused = False; pause_origin = 'ls'; state = 'play'
+                play_sfx('start'); music_set_state('play')
+
+            def _launch_custom(idx):
+                nonlocal walls, enemies, player, pulses, decoys, tick, exit_rect
+                nonlocal traps, micro_pulse_timer, wall_grid
+                nonlocal lv_timer, trap_respawn_cd, blackout_cd, mech, active_cfg
+                nonlocal score, pulse_count, game_ticks, sfx_played, player2, paused
+                nonlocal pause_origin, state
+                nonlocal floor_hazards, noise_zones, echo_orbs, rocks, absorber
+                nonlocal rock_mode, heartbeat_t, mimics, stalkers
+                data = custom_level_load(custom_names[idx])
+                if not data:
+                    return
+                grid = data
+                w2, e2, ppos2, ex2, tr2, wg2 = build_map_from_editor(
+                    grid, COLS, ROWS, TILE,
+                    Wall, BatEnemy, Enemy, SoundTrap, ExitTile, MAT_NORMAL)
+                walls, enemies, exit_rect, traps, wall_grid = w2, e2, ex2, tr2, wg2
+                player = Player(*ppos2)
+                pulses = []; decoys = DECOY_COUNT; tick = 0
+                micro_pulse_timer = lv_timer = trap_respawn_cd = blackout_cd = 0
+                mech = None; active_cfg = {}
+                floor_hazards = []; noise_zones = []; echo_orbs = []
+                rocks = []; absorber = SoundAbsorber(); rock_mode = False; heartbeat_t = 0
+                mimics = []; stalkers = []
+                score = 0; pulse_count = 0; game_ticks = 0; sfx_played = False
+                player2 = Player2(player.x + TILE, player.y) if coop_enabled else None
+                paused = False; pause_origin = 'ls'; state = 'play'
+                play_sfx('start'); music_set_state('play')
+
             for ev in events:
                 if ev.type == pygame.KEYDOWN:
-                    if ev.key == pygame.K_ESCAPE: state = 'intro'; show_credits = False
-                    if ev.key == pygame.K_UP:   current_level = max(0, current_level - 1)
-                    if ev.key == pygame.K_DOWN: current_level = min(max_unlocked, current_level + 1)
-                    if ev.key in (pygame.K_RETURN, pygame.K_SPACE) and current_level <= max_unlocked:
-                        (walls, enemies, player, pulses, decoys, tick, exit_rect,
-                         traps, micro_pulse_timer, wall_grid,
-                         lv_timer, trap_respawn_cd, blackout_cd, mech, active_cfg) = new_game(current_level)
-                        score = 0; pulse_count = 0; game_ticks = 0
-                        state = 'play'
+                    if ev.key == pygame.K_ESCAPE:
+                        state = 'intro'; show_credits = False
+                    elif ev.key == pygame.K_c:
+                        coop_enabled = not coop_enabled
+                    elif ls_tab == "normal":
+                        if ev.key == pygame.K_UP:
+                            current_level = max(0, current_level - 1)
+                        elif ev.key == pygame.K_DOWN:
+                            current_level = min(max_unlocked, current_level + 1)
+                        elif ev.key in (pygame.K_RETURN, pygame.K_SPACE) and current_level <= max_unlocked:
+                            _launch_normal()
+                    else:
+                        if ev.key == pygame.K_UP:
+                            custom_sel = max(0, custom_sel - 1)
+                        elif ev.key == pygame.K_DOWN:
+                            custom_sel = min(max(0, len(custom_names)-1), custom_sel + 1)
+                        elif ev.key in (pygame.K_RETURN, pygame.K_SPACE) and custom_names:
+                            _launch_custom(custom_sel)
+
                 if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                    crects, play_r = draw_level_select(screen, ls_tick, current_level, max_unlocked, font, small_font)
-                    for i, r in enumerate(crects):
-                        if r.collidepoint(ev.pos) and i <= max_unlocked: current_level = i
-                    if play_r.collidepoint(ev.pos) and current_level <= max_unlocked:
-                        (walls, enemies, player, pulses, decoys, tick, exit_rect,
-                         traps, micro_pulse_timer, wall_grid,
-                         lv_timer, trap_respawn_cd, blackout_cd, mech, active_cfg) = new_game(current_level)
-                        score = 0; pulse_count = 0; game_ticks = 0
-                        state = 'play'
-                if ev.type == pygame.FINGERDOWN:
-                    sx, sy = int(ev.x * W), int(ev.y * H)
-                    crects, play_r = draw_level_select(screen, ls_tick, current_level, max_unlocked, font, small_font)
-                    for i, r in enumerate(crects):
-                        if r.collidepoint((sx, sy)) and i <= max_unlocked: current_level = i
-                    if play_r.collidepoint((sx, sy)) and current_level <= max_unlocked:
-                        (walls, enemies, player, pulses, decoys, tick, exit_rect,
-                         traps, micro_pulse_timer, wall_grid,
-                         lv_timer, trap_respawn_cd, blackout_cd, mech, active_cfg) = new_game(current_level)
-                        state = 'play'
-            draw_level_select(screen, ls_tick, current_level, max_unlocked, font, small_font)
+                    (crects, play_r, tab_nr, tab_cr,
+                     c_crects, c_play_r, c_del_r) = _ls_draw()
+
+                    if tab_nr.collidepoint(ev.pos):
+                        ls_tab = "normal"
+                    elif tab_cr.collidepoint(ev.pos):
+                        ls_tab = "custom"
+                        custom_names = custom_levels_list()
+                    elif ls_tab == "normal":
+                        for i, r in enumerate(crects):
+                            if r.collidepoint(ev.pos) and i <= max_unlocked:
+                                current_level = i
+                        if play_r.collidepoint(ev.pos) and current_level <= max_unlocked:
+                            _launch_normal()
+                    else:
+                        for i, r in enumerate(c_crects):
+                            if r.collidepoint(ev.pos):
+                                custom_sel = i
+                        if c_del_r.width > 0 and c_del_r.collidepoint(ev.pos) and custom_names:
+                            custom_level_delete(custom_names[custom_sel])
+                            custom_names = custom_levels_list()
+                            custom_sel = max(0, min(custom_sel, len(custom_names)-1))
+                        elif c_play_r.collidepoint(ev.pos) and custom_names:
+                            _launch_custom(custom_sel)
+
+            music_set_state('menu')
+            _ls_draw()
             pygame.display.flip()
             await asyncio.sleep(0); continue
 
-        # ════ LEVEL COMPLETE ══════════════════════════════════════════════
+        # LEVEL COMPLETE 
         if state == 'comp':
             comp_tick += 1
             for ev in events:
@@ -1734,17 +2489,224 @@ async def main():
             pygame.display.flip()
             await asyncio.sleep(0); continue
 
-        # ════ GAMEPLAY ════════════════════════════════════════════════════
-        tick += 1
+        # LEADERBOARD
+        if state == 'lb':
+            lb_tick += 1
+            music_set_state('none')
+            for ev in events:
+                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                    state = 'intro'
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    back_r, local_r, global_r = draw_leaderboard(
+                        screen, font, small_font, lb_tick,
+                        LEVEL_CONFIGS, TILE, BLACK, CYAN, GOLD, GREEN, DARK_CYAN,
+                        lb_tab=lb_tab)
+                    if back_r.collidepoint(ev.pos):
+                        state = 'intro'
+                    elif local_r.collidepoint(ev.pos):
+                        lb_tab = 'local'
+                    elif global_r.collidepoint(ev.pos):
+                        lb_tab = 'global'
+                        ol_fetch_all(N_LEVELS, force=False)
+            # Trigger a background fetch when first entering global tab
+            if lb_tab == 'global' and lb_tick == 1:
+                ol_fetch_all(N_LEVELS, force=False)
+            draw_leaderboard(screen, font, small_font, lb_tick,
+                             LEVEL_CONFIGS, TILE, BLACK, CYAN, GOLD, GREEN, DARK_CYAN,
+                             lb_tab=lb_tab)
+            pygame.display.flip()
+            await asyncio.sleep(0); continue
+
+        # NAME INPUT  (shown only on new record)
+        if state == 'name_input':
+            ni_tick += 1
+            for ev in events:
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_ESCAPE:
+                        # Skip saving name — save with placeholder and continue
+                        lb_submit(current_level, "---", game_ticks, score)
+                        ol_submit(current_level, "---", game_ticks, score)
+                        state = 'comp'; comp_tick = 0
+                    elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        final_name = name_buf.strip() or "---"
+                        lb_submit(current_level, final_name, game_ticks, score)
+                        ol_submit(current_level, final_name, game_ticks, score)
+                        state = 'comp'; comp_tick = 0
+                    elif ev.key == pygame.K_BACKSPACE:
+                        name_buf = name_buf[:-1]
+                    else:
+                        ch = ev.unicode
+                        if ch and ch.isprintable() and len(name_buf) < 16:
+                            name_buf += ch
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    conf_r = draw_name_input(
+                        screen, font, small_font, ni_tick, name_buf,
+                        current_level, score, game_ticks,
+                        LEVEL_CONFIGS, TILE, BLACK, CYAN, GOLD, GREEN, WHITE)
+                    if conf_r.collidepoint(ev.pos) and name_buf.strip():
+                        final_name = name_buf.strip()
+                        lb_submit(current_level, final_name, game_ticks, score)
+                        ol_submit(current_level, final_name, game_ticks, score)
+                        state = 'comp'; comp_tick = 0
+            draw_name_input(
+                screen, font, small_font, ni_tick, name_buf,
+                current_level, score, game_ticks,
+                LEVEL_CONFIGS, TILE, BLACK, CYAN, GOLD, GREEN, WHITE)
+            pygame.display.flip()
+            await asyncio.sleep(0); continue
+
+        # LEVEL EDITOR
+
+        if state == 'editor':
+            editor_tick += 1
+            mpos = pygame.mouse.get_pos()
+            # Compute which grid cell the mouse is over
+            if mpos[1] >= 38:
+                mc_r = (mpos[1] - 38) // TILE
+                mc_c = mpos[0] // TILE
+                if 0 <= mc_r < ROWS and 0 <= mc_c < COLS:
+                    mouse_cell = (mc_r, mc_c)
+                else:
+                    mouse_cell = None
+            else:
+                mouse_cell = None
+
+            for ev in events:
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_ESCAPE:
+                        state = 'intro'
+                    # Number keys 1-8 select palette
+                    if pygame.K_1 <= ev.key <= pygame.K_8:
+                        editor_sel = ev.key - pygame.K_1
+                if ev.type == pygame.MOUSEWHEEL:
+                    editor_sel = (editor_sel - ev.y) % len(EDITOR_PALETTE)
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    # Check action buttons first
+                    pr, cr, br, sr = draw_editor(screen, font, small_font, editor_grid,
+                                                 editor_sel, editor_tick, mouse_cell,
+                                                 TILE, COLS, ROWS, WHITE, CYAN, DARK_CYAN)
+                    if pr.collidepoint(mpos):
+                        # Launch the custom map
+                        w2, e2, ppos2, ex2, tr2, wg2 = build_map_from_editor(
+                            editor_grid, COLS, ROWS, TILE,
+                            Wall, BatEnemy, Enemy, SoundTrap, ExitTile, MAT_NORMAL)
+                        walls, enemies, exit_rect, traps, wall_grid = w2, e2, ex2, tr2, wg2
+                        player = Player(*ppos2)
+                        pulses = []; decoys = DECOY_COUNT; tick = 0
+                        micro_pulse_timer = lv_timer = trap_respawn_cd = blackout_cd = 0
+                        mech = None; active_cfg = {}
+                        score = 0; pulse_count = 0; game_ticks = 0; sfx_played = False
+                        player2 = None
+                        paused = False; pause_origin = 'editor'
+                        state = 'play'
+                    elif sr.collidepoint(mpos):
+                        editor_save_open = True
+                        editor_save_buf  = ""
+                        editor_save_tick = 0
+                    elif cr.collidepoint(mpos):
+                        editor_grid = empty_editor_grid(COLS, ROWS)
+                    elif br.collidepoint(mpos):
+                        state = 'intro'
+                    elif mouse_cell:
+                        sym = EDITOR_PALETTE[editor_sel][0]
+                        r2, c2 = mouse_cell
+                        editor_grid[r2][c2] = '.' if sym == 'X' else sym
+
+            # Save dialog keyboard handling
+            if editor_save_open:
+                for ev in events:
+                    if ev.type == pygame.KEYDOWN:
+                        if ev.key == pygame.K_ESCAPE:
+                            editor_save_open = False
+                        elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                            if editor_save_buf.strip():
+                                custom_level_save(editor_save_buf.strip(), editor_grid)
+                                editor_save_open = False
+                        elif ev.key == pygame.K_BACKSPACE:
+                            editor_save_buf = editor_save_buf[:-1]
+                        else:
+                            ch = ev.unicode
+                            if ch and ch.isprintable() and len(editor_save_buf) < 20:
+                                editor_save_buf += ch
+
+            # Drag-paint on hold (skip when save dialog open)
+            if not editor_save_open and pygame.mouse.get_pressed()[0] and mouse_cell:
+                sym = EDITOR_PALETTE[editor_sel][0]
+                r2, c2 = mouse_cell
+                editor_grid[r2][c2] = '.' if sym == 'X' else sym
+
+            pr, cr, br, sr = draw_editor(screen, font, small_font, editor_grid,
+                                         editor_sel, editor_tick, mouse_cell,
+                                         TILE, COLS, ROWS, WHITE, CYAN, DARK_CYAN)
+            if editor_save_open:
+                editor_save_tick += 1
+                existing = custom_levels_list()
+                ok_r2, canc_r2 = draw_save_level_dialog(
+                    screen, font, small_font, editor_save_tick,
+                    editor_save_buf, existing, BLACK=BLACK, CYAN=CYAN, WHITE=WHITE)
+                for ev in events:
+                    if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                        if ok_r2.collidepoint(ev.pos) and editor_save_buf.strip():
+                            custom_level_save(editor_save_buf.strip(), editor_grid)
+                            editor_save_open = False
+                        elif canc_r2.collidepoint(ev.pos):
+                            editor_save_open = False
+            pygame.display.flip()
+            await asyncio.sleep(0); continue
+
+
+        # GAMEPLAY
+        if not paused:
+            tick += 1
 
         for ev in events:
             if ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE: state = 'ls'; ls_tick = 0
-                if ev.key == pygame.K_r:
-                    (walls, enemies, player, pulses, decoys, tick, exit_rect,
-                     traps, micro_pulse_timer, wall_grid,
-                     lv_timer, trap_respawn_cd, blackout_cd, mech, active_cfg) = new_game(current_level)
-                    score = 0; pulse_count = 0; game_ticks = 0
+                if ev.key == pygame.K_ESCAPE:
+                    if not player.caught and not player.won:
+                        paused = not paused
+                        pause_tick = 0
+                if ev.key == pygame.K_r and not paused:
+                    if pause_origin == 'ls':
+                        (walls, enemies, player, pulses, decoys, tick, exit_rect,
+                         traps, micro_pulse_timer, wall_grid,
+                         lv_timer, trap_respawn_cd, blackout_cd, mech, active_cfg,
+                         floor_hazards, noise_zones, echo_orbs, absorber) = new_game(current_level)
+                        mimics   = [e for e in enemies if isinstance(e, MimicEnemy)]
+                        stalkers = [e for e in enemies if isinstance(e, StalkerEnemy)]
+                        rocks = []; rock_mode = False; heartbeat_t = 0
+                    else:
+                        w2, e2, ppos2, ex2, tr2, wg2 = build_map_from_editor(
+                            editor_grid, COLS, ROWS, TILE,
+                            Wall, BatEnemy, Enemy, SoundTrap, ExitTile, MAT_NORMAL)
+                        walls, enemies, exit_rect, traps, wall_grid = w2, e2, ex2, tr2, wg2
+                        player = Player(*ppos2)
+                        floor_hazards = []; noise_zones = []; echo_orbs = []
+                        rocks = []; absorber = SoundAbsorber(); rock_mode = False
+                        mimics = []; stalkers = []
+                    pulses = []; decoys = DECOY_COUNT; tick = 0
+                    score = 0; pulse_count = 0; game_ticks = 0; sfx_played = False
+                    paused = False
+                # New: Q toggles rock-throw mode
+                if ev.key == pygame.K_q and not paused:
+                    rock_mode = not rock_mode
+                # New: E activates sound absorber
+                if ev.key == pygame.K_e and not paused and not player.caught and not player.won:
+                    absorber.activate()
+                # New: F fires focused cone sonar
+                if ev.key == pygame.K_f and not paused and not player.caught and not player.won:
+                    mx, my = pygame.mouse.get_pos()
+                    ox2 = int(max(0, min(player.x - VIEW_W//2, MAP_W - VIEW_W)))
+                    oy2 = int(max(0, min(player.y - VIEW_H//2, MAP_H - VIEW_H)))
+                    wx2 = mx + ox2; wy2 = (my - HUD_TOP) + oy2
+                    ang = math.atan2(wy2 - player.y, wx2 - player.x)
+                    # fire 5 thin rays in the cone
+                    for da in [-2, -1, 0, 1, 2]:
+                        ra = ang + math.radians(da * (CONE_ANGLE / 2))
+                        p_cone = SonarPulse(player.x, player.y, (0, 255, 180),
+                                            max_radius=CONE_RANGE)
+                        pulses.append(p_cone)
+                    pulse_count += 1
+                    play_sfx("sonar")
             # Mouse: clic en botones de derrota
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and player.caught:
                 cx_d, cy_d = W // 2, H // 2
@@ -1758,40 +2720,55 @@ async def main():
                 if r_rect_d.collidepoint(ev.pos):  # Reintentar
                     (walls, enemies, player, pulses, decoys, tick, exit_rect,
                      traps, micro_pulse_timer, wall_grid,
-                     lv_timer, trap_respawn_cd, blackout_cd, mech, active_cfg) = new_game(current_level)
+                     lv_timer, trap_respawn_cd, blackout_cd, mech, active_cfg,
+                     floor_hazards, noise_zones, echo_orbs, absorber) = new_game(current_level)
+                    mimics   = [e for e in enemies if isinstance(e, MimicEnemy)]
+                    stalkers = [e for e in enemies if isinstance(e, StalkerEnemy)]
+                    rocks = []; rock_mode = False; heartbeat_t = 0
                     score = 0; pulse_count = 0; game_ticks = 0
                 elif m_rect_d.collidepoint(ev.pos):  # Menú
                     state = 'ls'; ls_tick = 0
-            # Mouse: sonar / decoy
+            # Mouse: sonar / decoy / rock
             if ev.type == pygame.MOUSEBUTTONDOWN and not player.caught and not player.won:
                 ox = int(max(0, min(player.x - VIEW_W//2, MAP_W - VIEW_W)))
                 oy = int(max(0, min(player.y - VIEW_H//2, MAP_H - VIEW_H)))
                 wx = ev.pos[0] + ox
                 wy = (ev.pos[1] - HUD_TOP) + oy
                 if ev.button == 1:
-                    pulses.append(SonarPulse(player.x, player.y, CYAN))
-                    pulse_count += 1
-                    play_sound(_snd_sonar)
+                    if rock_mode:
+                        if math.hypot(wx - player.x, wy - player.y) <= ROCK_RANGE:
+                            rocks.append(ThrowableRock(player.x, player.y, wx, wy))
+                        rock_mode = False
+                    else:
+                        new_p = SonarPulse(player.x, player.y, CYAN)
+                        pulses.append(new_p)
+                        pulse_count += 1
+                        play_sfx("sonar")
+                        for st in stalkers:
+                            st.on_sonar_detected(player.x, player.y)
+                        for mc2 in mimics:
+                            if dist((mc2.x, mc2.y), (player.x, player.y)) < SONAR_MAX_RADIUS:
+                                mc2.on_sonar_hit()
                 elif ev.button == 3 and decoys > 0:
                     pulses.append(SonarPulse(wx, wy, PURPLE, is_decoy=True))
                     for e in enemies:
                         if dist((e.x,e.y),(wx,wy)) < SONAR_MAX_RADIUS: e.alert(wx, wy)
                     decoys -= 1
-                    play_sound(_snd_sonar)
+                    play_sfx("sonar")
 
 
         # Movement (keyboard)
         if not player.caught and not player.won:
             keys     = pygame.key.get_pressed()
             sneaking = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
-            dx = int(keys[pygame.K_d] or keys[pygame.K_RIGHT]) - \
-                 int(keys[pygame.K_a] or keys[pygame.K_LEFT])
-            dy = int(keys[pygame.K_s] or keys[pygame.K_DOWN]) - \
-                 int(keys[pygame.K_w] or keys[pygame.K_UP])
+            in_noise = any(nz.contains(player.x, player.y) for nz in noise_zones)
+            # P1 uses WASD only — arrow keys reserved for Player 2 (co-op)
+            dx = int(keys[pygame.K_d]) - int(keys[pygame.K_a])
+            dy = int(keys[pygame.K_s]) - int(keys[pygame.K_w])
             if dx or dy:
                 ndx, ndy = normalize(dx, dy)
                 player.move(ndx, ndy, walls, sneaking)
-                if not sneaking:
+                if not sneaking and not in_noise:
                     micro_pulse_timer += 1
                     if micro_pulse_timer >= MICRO_PULSE_INTERVAL:
                         micro_pulse_timer = 0
@@ -1804,6 +2781,27 @@ async def main():
             if exit_rect and pygame.Rect(player.x-PLAYER_RADIUS, player.y-PLAYER_RADIUS,
                                          PLAYER_RADIUS*2, PLAYER_RADIUS*2).colliderect(exit_rect.rect):
                 player.won = True
+            # Co-op: player 2 exit check
+            if player2 and exit_rect and pygame.Rect(
+                    player2.x - PLAYER_RADIUS, player2.y - PLAYER_RADIUS,
+                    PLAYER_RADIUS*2, PLAYER_RADIUS*2).colliderect(exit_rect.rect):
+                player.won = True   # both players win together
+
+        # Co-op: move player 2
+        if player2 and not player.caught and not player.won:
+            keys2 = pygame.key.get_pressed()
+            moved2, sneak2 = player2.handle_keys(keys2, walls)
+            if moved2 and not sneak2:
+                micro_pulse_timer2 += 1
+                if micro_pulse_timer2 >= MICRO_PULSE_INTERVAL:
+                    micro_pulse_timer2 = 0
+                    pulses.append(SonarPulse(player2.x, player2.y, (0,100,130), max_radius=60))
+            else:
+                micro_pulse_timer2 = 0
+            # Enemy proximity for player2
+            for e in enemies:
+                if dist((e.x, e.y), (player2.x, player2.y)) < 36:
+                    player.caught = True
 
         # Level mechanics
         if not player.caught and not player.won:
@@ -1830,41 +2828,103 @@ async def main():
             max_unlocked = max(max_unlocked, current_level + 1)
             score = calc_score(game_ticks, pulse_count, current_level)
             if not sfx_played:
-                play_sound(_snd_win)
+                play_sfx("win")
                 sfx_played = True
-            state = 'comp'; comp_tick = 0
+                music_set_state("win")
+            # Check record BEFORE saving
+            is_normal_level = active_cfg in LEVEL_CONFIGS
+            if is_normal_level and lb_is_record(current_level, game_ticks):
+                # New record! Ask for name first
+                name_buf = ""
+                ni_tick  = 0
+                state    = 'name_input'
+            else:
+                # Not a record (or editor level) — go straight to result screen
+                if is_normal_level:
+                    lb_submit(current_level, "---", game_ticks, score)
+                state = 'comp'; comp_tick = 0
             await asyncio.sleep(0); continue
 
         if player.caught and not sfx_played:
-            play_sound(_snd_lose)
+            play_sfx("lose")
             sfx_played = True
+            music_set_state("lose")
 
-        # Pulses
-        new_from = []
-        for p in pulses:
-            ex2 = p.update(walls, enemies, exit_rect, player)
-            if ex2: new_from.extend(ex2)
-        pulses = [p for p in pulses if not p.dead]
-        pulses.extend(new_from)
+        if not paused:
+            # Pulses
+            new_from = []
+            for p in pulses:
+                ex2 = p.update(walls, enemies, exit_rect, player)
+                if ex2: new_from.extend(ex2)
+            pulses = [p for p in pulses if not p.dead]
+            pulses.extend(new_from)
 
-        for w in walls: w.update()
+            for w in walls: w.update()
 
-        if not player.caught and not player.won:
-            for e in enemies:
-                res = e.update(walls, player, enemies, wall_grid)
-                if res is not None: pulses.append(res)
-            for e in enemies:
-                if isinstance(e, HeavyEnemy):
-                    for p in pulses:
-                        if not p.is_decoy and not p.catches_player:
-                            if dist((e.x,e.y),(p.x,p.y)) < HEAVY_HEAR_RADIUS:
-                                e.alert(p.x,p.y); break
-            for trap in traps:
-                tp = trap.check(player)
-                if tp is not None:
-                    pulses.append(tp)
-                    for e in enemies: e.alert(trap.cx, trap.cy)
-                    play_sound(_snd_trap)
+            if not player.caught and not player.won:
+                for e in enemies:
+                    res = e.update(walls, player, enemies, wall_grid)
+                    if res is not None: pulses.append(res)
+                for e in enemies:
+                    if isinstance(e, HeavyEnemy):
+                        for p in pulses:
+                            if not p.is_decoy and not p.catches_player:
+                                if dist((e.x,e.y),(p.x,p.y)) < HEAVY_HEAR_RADIUS:
+                                    e.alert(p.x,p.y); break
+                for trap in traps:
+                    tp = trap.check(player)
+                    if tp is not None:
+                        pulses.append(tp)
+                        for e in enemies: e.alert(trap.cx, trap.cy)
+                        play_sfx("trap")
+
+                # NEW: floor hazards
+                sneaking_now = pygame.key.get_pressed()[pygame.K_LSHIFT] or \
+                               pygame.key.get_pressed()[pygame.K_RSHIFT]
+                for fh in floor_hazards:
+                    fh.update()
+                    fhp = fh.check(player, sneaking=sneaking_now)
+                    if fhp:
+                        pulses.append(fhp)
+                        for e in enemies: e.alert(fh.cx, fh.cy)
+                floor_hazards = [fh for fh in floor_hazards if not fh.gone or fh.htype == HAZARD_WATER]
+
+                # NEW: noise zones
+                for nz in noise_zones:
+                    nz.update()
+
+                # NEW: echo orbs
+                for orb in echo_orbs:
+                    orb.update()
+                    orb.check(player)
+
+                # NEW: rocks in flight
+                new_rocks = []
+                for rock in rocks:
+                    rp = rock.update(walls)
+                    if rp:
+                        pulses.append(rp)
+                        for e in enemies: e.alert(rock.x, rock.y)
+                    if not rock.dead:
+                        new_rocks.append(rock)
+                rocks = new_rocks
+
+                # NEW: absorber update
+                absorber.update()
+
+                # NEW: mimic update
+                for mc2 in mimics:
+                    mc2.update(player)
+
+                # NEW: heartbeat based on alert level
+                if not player.caught and not player.won:
+                    n_alert = sum(1 for e in enemies
+                                  if hasattr(e, 'alert_t') and e.alert_t > 0)
+                    if n_alert > 0:
+                        ratio = min(1.0, n_alert / max(len(enemies), 1))
+                        hb_interval = int(HEARTBEAT_MIN - ratio * (HEARTBEAT_MIN - HEARTBEAT_MAX))
+                        heartbeat_t -= 1
+
 
         # Camera
         off_x = int(max(0, min(player.x - VIEW_W//2, MAP_W - VIEW_W)))
@@ -1896,16 +2956,69 @@ async def main():
             pygame.draw.rect(game_surf, GOLD, er, 2)
 
         for trap in traps: trap.draw(game_surf, offset)
-        for p in pulses:   p.draw(game_surf, offset)
-        for e in enemies:  e.draw(game_surf, offset)
+        for fh in floor_hazards: fh.draw(game_surf, offset)
+        for nz in noise_zones:   nz.draw(game_surf, offset)
+        for orb in echo_orbs:    orb.draw(game_surf, offset)
+        for rock in rocks:       rock.draw(game_surf, offset)
+        for mc2 in mimics:       mc2.draw(game_surf, offset)
+        for p in pulses:         p.draw(game_surf, offset)
+        for e in enemies:        e.draw(game_surf, offset)
         player.draw(game_surf, offset)
+        if player2:
+            player2.draw(game_surf, offset)
+
 
         screen.blit(game_surf, (0, HUD_TOP))
 
         alert_count = sum(1 for e in enemies if e.alert_t > 0)
+
+        # Adaptive music state (drives alert vs. play) 
+        if state == 'play' and not player.caught and not player.won:
+            if alert_count > 0:
+                music_set_state('alert')
+            else:
+                music_set_state('play')
+        music_tick()
+
         draw_hud(screen, font, small_font, decoys, alert_count,
                  player.caught, player.won, current_level, lv_timer, mech, tick,
                  score, pulse_count)
+        # Extra HUD elements for new features
+        absorber.draw_hud(screen, W - 200, H - 22, small_font)
+        if rock_mode:
+            try: rm_f = pygame.font.SysFont("consolas", 13, bold=True)
+            except: rm_f = small_font
+            rm_s = rm_f.render("[ROCA] Clic para lanzar", True, (255, 200, 80))
+            screen.blit(rm_s, (W//2 - rm_s.get_width()//2, H - 40))
+        # Echo orb messages (draw on screen overlay)
+        for orb in echo_orbs:
+            orb.draw_message(screen, small_font)
+        # Heartbeat vignette
+        n_alert2 = sum(1 for e in enemies if hasattr(e, 'alert_t') and e.alert_t > 0)
+        if n_alert2 > 0 and not player.caught and not player.won:
+            ratio2 = min(1.0, n_alert2 / max(len(enemies), 1))
+            hb_alpha = int(40 * ratio2 * (math.sin(tick * 0.15 * (1 + ratio2)) * 0.5 + 0.5))
+            if hb_alpha > 2:
+                vign = pygame.Surface((W, H), pygame.SRCALPHA)
+                vign.fill((80, 0, 0, hb_alpha))
+                screen.blit(vign, (0, 0))
+
+        # Pause menu overlay 
+        if paused:
+            pause_tick += 1
+            # freeze game progression
+            p_rects = draw_pause_menu(screen, font, small_font, pause_tick,
+                                      from_editor=(pause_origin == 'editor'),
+                                      BLACK=BLACK, CYAN=CYAN, WHITE=WHITE)
+            # handle pause button clicks
+            for ev in events:
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    if p_rects['resume'].collidepoint(ev.pos):
+                        paused = False
+                    elif 'editor' in p_rects and p_rects['editor'].collidepoint(ev.pos):
+                        paused = False; state = 'editor'
+                    elif p_rects['menu'].collidepoint(ev.pos):
+                        paused = False; state = 'intro'; show_credits = False
 
         pygame.display.flip()
         await asyncio.sleep(0)
